@@ -103,10 +103,6 @@ export class PostproductionRenderer extends RendererWith2D {
     } else {
       this.three.render(scene, camera);
     }
-    if (scene instanceof THREE.Scene) {
-      this.three2D.render(scene, camera);
-    }
-
     if (this.mode === OBC.RendererMode.MANUAL) {
       // Use postproduction only on last frame
       if (this._timeout) {
@@ -120,7 +116,9 @@ export class PostproductionRenderer extends RendererWith2D {
 
         this.setStyleWithoutEvent(this._previousStyle);
 
-        this.postproduction.update();
+        if (this.postproduction.enabled) {
+          this.postproduction.update();
+        }
       }, this.manualModeDelay);
     }
 

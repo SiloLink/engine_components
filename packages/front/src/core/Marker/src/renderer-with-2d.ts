@@ -24,7 +24,7 @@ export class RendererWith2D extends SimpleRenderer {
       const scene = this.currentWorld.scene.three;
       const camera = this.currentWorld.camera.three;
       if (scene instanceof THREE.Scene) {
-        this.three2D.render(scene, camera);
+        this.render2D(scene, camera);
       }
     });
 
@@ -38,6 +38,12 @@ export class RendererWith2D extends SimpleRenderer {
 
     this.setupHtmlRenderer();
     this.resize();
+  }
+
+  protected render2D(scene: THREE.Scene, camera: THREE.Camera) {
+    if (scene.getObjectByProperty("isCSS2DObject", true)) {
+      this.three2D.render(scene, camera);
+    }
   }
 
   private setupHtmlRenderer() {
