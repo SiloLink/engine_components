@@ -16,9 +16,8 @@ import { FragmentsManager } from "../../../fragments";
  * attribute (the internal item id). We render the BIM scene to an
  * offscreen target with a shader that packs `(modelByte, itemId)` into
  * RGBA, then `readPixels` at the cursor and decode. One render plus
- * one 4-byte readback per call. No worker round-trip for the model
- * lookup; the first time we resolve a given `itemId` to a `localId`
- * we ask the worker, and afterwards that lookup is cached.
+ * one 4-byte readback per call. The model and item identities resolve
+ * on the main thread through the dense map installed with each model.
  *
  * Encoding (one pixel):
  *   R = modelByte (1..254, 0 = void / unwritten)
@@ -59,20 +58,22 @@ export class FastModelPicker implements Disposable {
    * by the 8-bit `modelByte`. In practice we never approach this.
    */
   static readonly MAX_MODELS = 254;
+  static readonly PICK_SIZE = 4;
 
   private _renderTarget?: THREE.WebGLRenderTarget;
   private _renderTargetSize = new THREE.Vector2();
+  /** Detached camera whose projection is cropped to the cursor pixels. */
+  private _pickCamera?: THREE.Camera;
+  /** Reused projection transform for the detached pick camera. */
+  private _cropMatrix = new THREE.Matrix4();
 
   private _debugCanvas?: HTMLCanvasElement;
   private _debugContainer?: HTMLDivElement;
 
-  /**
-   * Single shared shader for the id pass. The same program runs across
-   * every model; we flip the `modelByte` uniform between per-model
-   * render passes inside one pick to disambiguate which model owns a
-   * pixel.
-   */
+  /** Base shader used to create model-specific id materials. */
   private _idMaterial: THREE.ShaderMaterial;
+  /** Reusable model-byte materials that share one shader program. */
+  private _idMaterials: THREE.ShaderMaterial[] = [];
 
   /**
    * Depth-encoding shader used by {@link getPointAt}. Written via
@@ -104,6 +105,26 @@ export class FastModelPicker implements Disposable {
     THREE.Material | THREE.Material[]
   >();
 
+  /** Reused temporary material arrays keyed by material and group count. */
+  private _materialArrays = new Map<
+    THREE.Material,
+    Map<number, THREE.Material[]>
+  >();
+
+  /** Latest measured identity pass, exposed only through a copied snapshot. */
+  private _lastIdentityPickStats?: {
+    prepareMs: number;
+    renderMs: number;
+    readbackMs: number;
+    restoreMs: number;
+    renderCalls: number;
+    renderTriangles: number;
+    tileCount: number;
+    visibleTileCount: number;
+  };
+  private _pickTileCount = 0;
+  private _pickVisibleTileCount = 0;
+
   /**
    * LOD line meshes don't carry the per-vertex `id` attribute and would
    * write whatever color their normal shader produces into the id
@@ -111,20 +132,6 @@ export class FastModelPicker implements Disposable {
    * restored after.
    */
   private _hiddenLods: THREE.Object3D[] = [];
-
-  /**
-   * The meshes each model owns, i.e. excluding those belonging to a
-   * model nested inside it. A delta model's object is parented under
-   * its parent model's object (see the fragments EditHelper), while
-   * both are listed as separate models, so subtree membership alone
-   * does not determine ownership.
-   *
-   * Populated in {@link applyIdMaterial}, consumed by
-   * {@link renderPickPass} to isolate one model per render without
-   * relying on root visibility. A nested model can't be isolated by
-   * its root, since hiding the parent's root culls the child too.
-   */
-  private _ownMeshes = new Map<string, THREE.Mesh[]>();
 
   constructor(components: Components, world: World) {
     if (!world.renderer) {
@@ -159,10 +166,9 @@ export class FastModelPicker implements Disposable {
    * Returns `{ modelId, localId }` for the item under the given screen
    * position, or `null` if the cursor is over empty space.
    *
-   * Pure main-thread resolution: fragments now stores the user-facing
-   * `localId` directly in each tile's per-vertex `id` attribute, so
-   * the encoded RGBA pixel decodes straight to the localId. No worker
-   * round-trip, no cache.
+   * The encoded RGBA pixel contains the Fragments-internal `itemId`.
+   * FragmentsModel installs a dense item/local-id map during setup, so its
+   * existing async translation API resolves locally without a worker trip.
    *
    * @param position - Normalized device coords. Defaults to the
    *   picker's last known mouse position.
@@ -174,15 +180,9 @@ export class FastModelPicker implements Disposable {
     if (!result) return null;
     // The vertex `id` attribute now encodes the internal **itemId**
     // (the FlatBuffer `sample.item()` index, key for `boxes.sampleOf`)
-    // rather than the user-facing localId. We changed the encoding to
-    // unblock the snap path, which can fetch sample data in O(1) by
-    // itemId vs the O(N_total_samples) scan needed when keyed by
-    // localId. The trade-off: callers expecting `localId` get one
-    // worker round-trip here for translation. The translation itself
-    // is two FlatBuffer accessor calls on the worker side, so the
-    // cost is dominated by the message hop, not the work. Internal
-    // consumers that only need itemId (e.g. snap) can read it from
-    // the result directly and skip the translation.
+    // rather than the user-facing localId. This lets internal consumers
+    // such as snapping use itemId directly, while the public result resolves
+    // localId through the model's setup-time dense main-thread map.
     const fragments = this.components.get(FragmentsManager);
     const model = fragments.list.get(result.modelId);
     if (!model) return null;
@@ -210,26 +210,18 @@ export class FastModelPicker implements Disposable {
    * @param position - Normalized device coords. Defaults to the
    *   picker's last known mouse position.
    */
-  async getPointAt(
-    position?: THREE.Vector2,
-  ): Promise<THREE.Vector3 | null> {
+  getPointAtSync(position?: THREE.Vector2): THREE.Vector3 | null {
     if (!this.enabled) return null;
     if (!this._renderTarget || !this.world.renderer) return null;
 
     const fragments = this.components.get(FragmentsManager);
     if (!fragments.initialized || fragments.list.size === 0) return null;
 
-    this.renderDepthPass();
-
     const pos = position ?? this.mouse.position;
-    const pixel = this.readPixelAt(pos);
+    const view = this.renderDepthPass(pos);
+    const pixel = this.readPixelAt(this._renderTarget, view.readX, view.readY);
     if (!pixel) return null;
-    if (
-      pixel[0] === 0 &&
-      pixel[1] === 0 &&
-      pixel[2] === 0 &&
-      pixel[3] === 0
-    ) {
+    if (pixel[0] === 0 && pixel[1] === 0 && pixel[2] === 0 && pixel[3] === 0) {
       return null; // cleared / void — nothing was drawn here
     }
 
@@ -243,6 +235,13 @@ export class FastModelPicker implements Disposable {
   }
 
   /**
+   * Asynchronous compatibility wrapper for {@link getPointAtSync}.
+   */
+  async getPointAt(position?: THREE.Vector2): Promise<THREE.Vector3 | null> {
+    return this.getPointAtSync(position);
+  }
+
+  /**
    * Returns the world-space surface normal under the cursor, or `null`
    * if the cursor is over empty space.
    *
@@ -250,18 +249,15 @@ export class FastModelPicker implements Disposable {
    * render with the normal-encoding shader, one 4-byte readback,
    * decode and renormalize.
    */
-  async getNormalAt(
-    position?: THREE.Vector2,
-  ): Promise<THREE.Vector3 | null> {
+  async getNormalAt(position?: THREE.Vector2): Promise<THREE.Vector3 | null> {
     if (!this.enabled) return null;
     if (!this._renderTarget || !this.world.renderer) return null;
     const fragments = this.components.get(FragmentsManager);
     if (!fragments.initialized || fragments.list.size === 0) return null;
 
-    this.renderNormalPass();
-
     const pos = position ?? this.mouse.position;
-    const pixel = this.readPixelAt(pos);
+    const view = this.renderNormalPass(pos);
+    const pixel = this.readPixelAt(this._renderTarget, view.readX, view.readY);
     if (!pixel) return null;
     if (pixel[3] === 0) return null; // void pixel — nothing rendered here
 
@@ -317,16 +313,27 @@ export class FastModelPicker implements Disposable {
     else this.removeDebugCanvas();
   }
 
+  /** Latest identity-pass timings and submitted draw work. */
+  getLastIdentityPickStats() {
+    return this._lastIdentityPickStats
+      ? { ...this._lastIdentityPickStats }
+      : undefined;
+  }
+
   /** {@link Disposable.dispose} */
   dispose() {
     this.mouse.dispose();
     this.removeDebugCanvas();
-    this._idMaterial.dispose();
+    for (const material of this._idMaterials) material.dispose();
+    if (this._idMaterials.length === 0) this._idMaterial.dispose();
+    this._idMaterials.length = 0;
     this._depthMaterial.dispose();
     this._normalMaterial.dispose();
     if (this._renderTarget) this._renderTarget.dispose();
     this._renderTarget = undefined;
     this._originalMaterials.clear();
+    this._materialArrays.clear();
+    this._lastIdentityPickStats = undefined;
     this._hiddenLods.length = 0;
     this.onDisposed.trigger();
     this.onDisposed.reset();
@@ -337,22 +344,8 @@ export class FastModelPicker implements Disposable {
   // ---------------------------------------------------------------------------
 
   /**
-   * Runs the id renders and returns the raw decoded
-   * `(modelId, itemId)` for the cursor pixel. Two render passes:
-   *
-   *   - Pass 1 (`_renderTarget`): writes the model byte into R via
-   *     the `_idMaterial`. Used solely to disambiguate which model
-   *     owns the picked pixel.
-   *   - Pass 2 (`_localIdRenderTarget`): writes the full 32-bit
-   *     localId across all four bytes via the same `_idMaterial`
-   *     with `mode = 1`.
-   *
-   * Two single-attachment targets instead of MRT keeps the code
-   * portable and the diff small. Both passes use the same scene,
-   * camera and visibility toggling so depth tests resolve to the
-   * same front-most fragment per pixel.
-   *
-   * Both public entry points lean on this.
+   * Runs one id render and returns the raw decoded `(modelId, itemId)`
+   * for the cursor pixel. Model and item identity share one RGBA8 pixel.
    */
   private async runIdPass(
     position?: THREE.Vector2,
@@ -364,29 +357,57 @@ export class FastModelPicker implements Disposable {
     const fragments = this.components.get(FragmentsManager);
     if (!fragments.initialized || fragments.list.size === 0) return null;
 
+    const prepareStartedAt = performance.now();
     const byteToModel = this.applyIdMaterial();
+    const prepareMs = performance.now() - prepareStartedAt;
     if (byteToModel.size === 0) {
+      const restoreStartedAt = performance.now();
       this.restoreOriginalMaterials();
+      this._lastIdentityPickStats = {
+        prepareMs,
+        renderMs: 0,
+        readbackMs: 0,
+        restoreMs: performance.now() - restoreStartedAt,
+        renderCalls: 0,
+        renderTriangles: 0,
+        tileCount: this._pickTileCount,
+        visibleTileCount: this._pickVisibleTileCount,
+      };
       return null;
     }
 
-    // Resolve the cursor NDC up front so the render pass can use it
-    // for scissor clipping and we read back from the same pixel.
     const pos = position ?? this.mouse.position;
+    let view!: { camera: THREE.Camera; readX: number; readY: number };
+    let renderMs = 0;
+    let renderCalls = 0;
+    let renderTriangles = 0;
+    let restoreMs = 0;
+    try {
+      const renderStartedAt = performance.now();
+      view = this.renderIdPass(pos);
+      renderMs = performance.now() - renderStartedAt;
+      const renderInfo = this.world.renderer.three.info.render;
+      renderCalls = renderInfo.calls;
+      renderTriangles = renderInfo.triangles;
+    } finally {
+      const restoreStartedAt = performance.now();
+      this.restoreOriginalMaterials();
+      restoreMs = performance.now() - restoreStartedAt;
+    }
 
-    this.renderIdPass(byteToModel, pos);
-    this.restoreOriginalMaterials();
-
+    const readbackStartedAt = performance.now();
     if (this.debugMode && this._debugCanvas) this.updateDebugCanvas();
-
-    // Single readPixels — the most expensive thing in the pick path
-    // because it forces a synchronous GPU sync. Packing `modelByte`
-    // into R and the lower 3 bytes of `itemId + 1` into GBA lets us
-    // do one readback instead of two; with itemId capped at 24 bits
-    // (item count per model — 16 M is plenty for any practical BIM
-    // scene) the high byte of the vertex attribute is unused and we
-    // overwrite it with the model byte.
-    const pixel = this.readPixelAt(this._renderTarget, pos);
+    const pixel = this.readPixelAt(this._renderTarget, view.readX, view.readY);
+    this._lastIdentityPickStats = {
+      prepareMs,
+      renderMs,
+      readbackMs: performance.now() - readbackStartedAt,
+      restoreMs,
+      renderCalls,
+      renderTriangles,
+      tileCount: this._pickTileCount,
+      visibleTileCount: this._pickVisibleTileCount,
+    };
     if (!pixel) return null;
 
     const modelByte = pixel[0];
@@ -405,7 +426,6 @@ export class FastModelPicker implements Disposable {
     return { modelId, itemId };
   }
 
-
   /**
    * Walks every fragments model. For each shell mesh that carries the
    * per-vertex `id` attribute, stashes the original material and swaps
@@ -417,52 +437,39 @@ export class FastModelPicker implements Disposable {
   private applyIdMaterial(): Map<number, string> {
     const fragments = this.components.get(FragmentsManager);
     const byteToModel = new Map<number, string>();
-    const modelRoots = this.getModelRoots();
-    this._ownMeshes.clear();
+    this._pickTileCount = 0;
+    this._pickVisibleTileCount = 0;
+    const planes = this.world.renderer!.three.clippingPlanes ?? [];
     let nextByte = 1;
 
     for (const [modelId, model] of fragments.list) {
       if (nextByte > FastModelPicker.MAX_MODELS) break;
-      const owned: THREE.Mesh[] = [];
+      const idMaterial = this.getIdMaterial(nextByte);
+      idMaterial.clippingPlanes = planes;
+      idMaterial.clipping = planes.length > 0;
+      let hasOwnedMesh = false;
 
-      this.traverseOwn(model.object, modelRoots, (child) => {
-        if (!(child instanceof THREE.Mesh)) return;
+      for (const [, child] of model.tiles) {
+        if (!(child instanceof THREE.Mesh)) continue;
         const geom = child.geometry as THREE.BufferGeometry | undefined;
-        if (!geom) return;
+        if (!geom) continue;
         if (!geom.attributes || !geom.attributes.id) {
-          // No id attribute: LOD line mesh or similar. Hide so its
-          // normal shader doesn't write into our id target.
           if (child.visible) {
             this._hiddenLods.push(child);
             child.visible = false;
           }
-          return;
+          continue;
         }
+        this._pickTileCount += 1;
+        if (child.visible) this._pickVisibleTileCount += 1;
         this._originalMaterials.set(child, child.material);
-        // Wrap in an array so three honours `geometry.groups`. Fragments
-        // encodes per-item visibility as draw groups: each visible item
-        // contributes a range of indices to `geometry.groups` and hidden
-        // items are simply absent from the list. Three only iterates
-        // groups when the mesh's material is `Material[]`; with a single
-        // `Material` it falls back to drawing the whole indexed
-        // geometry, which would make hidden items pickable.
-        //
-        // Length must match the original. Fragments puts highlight
-        // materials in extra slots of `mesh.material` and tags the
-        // highlighted item's group with `materialIndex >= 1`. A
-        // length-1 swap array would make three skip those groups,
-        // so a click on a highlighted item would see through it to
-        // whatever's behind. Filling every slot with `_idMaterial`
-        // keeps every group pickable while still honouring per-item
-        // visibility (hidden items remain absent from `groups`).
         const original = child.material;
         const len = Array.isArray(original) ? original.length : 1;
-        child.material = new Array(len).fill(this._idMaterial);
-        owned.push(child);
-      });
+        child.material = this.getMaterialArray(idMaterial, len);
+        hasOwnedMesh = true;
+      }
 
-      if (!owned.length) continue;
-      this._ownMeshes.set(modelId, owned);
+      if (!hasOwnedMesh) continue;
       byteToModel.set(nextByte, modelId);
       nextByte += 1;
     }
@@ -471,82 +478,112 @@ export class FastModelPicker implements Disposable {
   }
 
   /**
-   * The object roots of every loaded model.
+   * Renders all visible BIM models in one id pass. Each model's meshes use
+   * a model-specific material, so normal depth testing resolves the
+   * front-most `(modelByte, itemId)` in a single scene render.
    */
-  private getModelRoots() {
-    const fragments = this.components.get(FragmentsManager);
-    const roots = new Set<THREE.Object3D>();
-    for (const [, model] of fragments.list) roots.add(model.object);
-    return roots;
+  private renderIdPass(ndc: THREE.Vector2) {
+    const view = this.createPickView(ndc);
+    this.renderPickPass(this._renderTarget!, view.camera);
+    return view;
   }
 
   /**
-   * Like `Object3D.traverse`, but prunes the subtree of any nested model
-   * root, so each mesh is visited exactly once, by the model that owns
-   * it. A delta model's object hangs under its parent model's object
-   * while being a model in its own right; a plain `traverse` from the
-   * parent would walk into it.
+   * Builds a detached camera whose projection covers only the 4×4 source-pixel
+   * region around the cursor. This preserves exact raster picking while letting
+   * three.js reject off-cursor tile meshes before draw submission.
    */
-  private traverseOwn(
-    root: THREE.Object3D,
-    modelRoots: Set<THREE.Object3D>,
-    callback: (child: THREE.Object3D) => void,
-  ) {
-    const stack: THREE.Object3D[] = [root];
-    while (stack.length) {
-      const node = stack.pop()!;
-      if (node !== root && modelRoots.has(node)) continue;
-      callback(node);
-      for (const child of node.children) stack.push(child);
+  private createPickView(ndc: THREE.Vector2) {
+    const sourceCamera = this.world.camera.three;
+    sourceCamera.updateWorldMatrix(true, false);
+    let camera = this._pickCamera;
+    if (!camera || camera.type !== sourceCamera.type) {
+      camera = (
+        sourceCamera.clone as unknown as (recursive: boolean) => THREE.Camera
+      )(false);
+      this._pickCamera = camera;
+    } else {
+      camera.copy(sourceCamera, false);
     }
+    sourceCamera.matrixWorld.decompose(
+      camera.position,
+      camera.quaternion,
+      camera.scale,
+    );
+    camera.updateMatrix();
+    camera.updateMatrixWorld(true);
+
+    const sourceWidth = Math.max(1, Math.floor(this._renderTargetSize.x));
+    const sourceHeight = Math.max(1, Math.floor(this._renderTargetSize.y));
+    const width = Math.min(FastModelPicker.PICK_SIZE, sourceWidth);
+    const height = Math.min(FastModelPicker.PICK_SIZE, sourceHeight);
+    if (
+      this._renderTarget!.width !== width ||
+      this._renderTarget!.height !== height
+    ) {
+      this._renderTarget!.setSize(width, height);
+    }
+    const sourceX = Math.max(
+      0,
+      Math.min(sourceWidth - 1, Math.floor((ndc.x + 1) * 0.5 * sourceWidth)),
+    );
+    const sourceY = Math.max(
+      0,
+      Math.min(sourceHeight - 1, Math.floor((ndc.y + 1) * 0.5 * sourceHeight)),
+    );
+    const startX = Math.max(
+      0,
+      Math.min(sourceWidth - width, sourceX - (width >> 1)),
+    );
+    const startY = Math.max(
+      0,
+      Math.min(sourceHeight - height, sourceY - (height >> 1)),
+    );
+    const centerX = (2 * (startX + width * 0.5)) / sourceWidth - 1;
+    const centerY = (2 * (startY + height * 0.5)) / sourceHeight - 1;
+    const scaleX = sourceWidth / width;
+    const scaleY = sourceHeight / height;
+    this._cropMatrix.set(
+      scaleX,
+      0,
+      0,
+      -centerX * scaleX,
+      0,
+      scaleY,
+      0,
+      -centerY * scaleY,
+      0,
+      0,
+      1,
+      0,
+      0,
+      0,
+      0,
+      1,
+    );
+    camera.projectionMatrix.multiplyMatrices(
+      this._cropMatrix,
+      sourceCamera.projectionMatrix,
+    );
+    camera.projectionMatrixInverse.copy(camera.projectionMatrix).invert();
+    return {
+      camera,
+      readX: sourceX - startX,
+      readY: sourceY - startY,
+    };
   }
 
   /**
-   * Renders the world scene to the id target one model at a time,
-   * flipping the `modelByte` uniform between renders. The depth buffer
-   * is shared across the per-model passes so the front-most item still
-   * wins each pixel regardless of which model it belongs to.
-   *
-   * Non-BIM meshes in the world scene (the user's own helpers, ground
-   * planes, hover proxies, anything else) are hidden for the duration
-   * of the render. Without this, their normal materials write whatever
-   * colour they happen to produce into the id target, which decodes as
-   * a bogus `(modelByte, itemId)` pair when the cursor lands on one.
-   */
-  /**
-   * Single id render. Iterates models in byte order, flipping the
-   * `modelByte` uniform between renders so each model's pixels carry
-   * its assigned byte in R while the lower 3 bytes of GBA carry
-   * `itemId + 1`. Depth buffer shared across the per-model passes so
-   * the front-most item still wins each pixel regardless of which
-   * model it belongs to.
-   */
-  private renderIdPass(byteToModel: Map<number, string>, ndc: THREE.Vector2) {
-    this.renderPickPass(byteToModel, this._renderTarget!, this._idMaterial, ndc);
-  }
-
-  /**
-   * Renders the BIM scene model-by-model into `target` with `material`,
-   * scissor-clipped to a small box around the cursor. Iterates models
-   * in byte order so depth tests resolve to the same front-most
-   * fragment per pixel. Per-model loop sets `material.uniforms.modelByte`
-   * before each render so the picked pixel carries the model byte.
+   * Renders the BIM scene once through the cropped pick camera. Non-BIM meshes
+   * are hidden for the duration.
    */
   private renderPickPass(
-    byteToModel: Map<number, string>,
     target: THREE.WebGLRenderTarget,
-    material: THREE.ShaderMaterial,
-    ndc: THREE.Vector2,
+    camera: THREE.Camera,
   ) {
     const renderer = this.world.renderer!.three;
     const scene = this.world.scene.three;
-    const camera = this.world.camera.three;
     const fragments = this.components.get(FragmentsManager);
-
-    const planes = renderer.clippingPlanes ?? [];
-    material.clippingPlanes = planes;
-    material.clipping = planes.length > 0;
-
     const prevTarget = renderer.getRenderTarget();
     const prevAutoClear = renderer.autoClear;
     const prevClearColor = renderer.getClearColor(new THREE.Color());
@@ -554,146 +591,25 @@ export class FastModelPicker implements Disposable {
     const prevScissorTest = renderer.getScissorTest();
     const prevScissor = renderer.getScissor(new THREE.Vector4());
 
-    // A non-null scene background makes three force-clear colour AND depth on
-    // every render() call (see WebGLBackground: an isColor background sets
-    // forceClear = true), even though we set autoClear = false to keep the
-    // depth buffer across the per-model id renders. That force-clear wipes the
-    // shared depth between models, so only the last-rendered (last-loaded)
-    // model survives in the id target and multi-model picking collapses to it
-    // (issues #737 / #773). Null the background for the pass and restore it
-    // afterwards.
     const prevBackground = (scene as THREE.Scene).background;
-    (scene as THREE.Scene).background = null;
-
-    renderer.setRenderTarget(target);
-    renderer.setClearColor(0x000000, 0);
-    renderer.autoClear = false;
-    // Clear the full target before scissoring — clears respect the
-    // scissor box, and we need the unread pixels to be 0 so a stale
-    // pick from a previous call can't bleed through.
-    renderer.setScissorTest(false);
-    renderer.clear(true, true, false);
-
-    // Tight scissor box around the cursor. We only ever read 1 pixel,
-    // so rasterising the rest of the framebuffer is wasted work.
-    // Vertex shading still runs for everything in view (three's
-    // per-mesh frustum culling handles macro-level pruning), but the
-    // fragment shader cost — usually the dominant term on a busy BIM
-    // scene with lots of overdraw — collapses to ~O(SCISSOR_PX²).
-    // 4×4 leaves a 1-pixel margin around the read site to absorb any
-    // sub-pixel rounding in NDC→pixel conversion without missing.
-    //
-    // DPR caveat: `WebGLRenderer.setScissor` always multiplies its
-    // arguments by the canvas pixelRatio before forwarding to GL,
-    // even when the active target is an offscreen FBO at a different
-    // resolution. The picker's FBO is sized in CSS pixels via
-    // `renderer.getSize()`, so on a hi-DPI display passing FBO-pixel
-    // coordinates straight through lands the GL scissor outside the
-    // FBO — every read pixel comes back zero. Pre-divide by the
-    // pixel ratio so three's multiplication restores the FBO-pixel
-    // coords we want.
-    const SCISSOR_PX = 4;
-    const tw = target.width;
-    const th = target.height;
-    const cx = Math.floor((ndc.x + 1) * 0.5 * tw);
-    // Match `readPixelAt`'s y mapping (origin at top in NDC, bottom in
-    // framebuffer) so the scissor box is centred on the readback pixel.
-    const cy = Math.floor((ndc.y + 1) * 0.5 * (th - 1));
-    const half = SCISSOR_PX >> 1;
-    const sx = Math.max(0, Math.min(tw - SCISSOR_PX, cx - half));
-    const sy = Math.max(0, Math.min(th - SCISSOR_PX, cy - half));
-    const dpr = renderer.getPixelRatio();
-    renderer.setScissor(
-      sx / dpr,
-      sy / dpr,
-      SCISSOR_PX / dpr,
-      SCISSOR_PX / dpr,
-    );
-    renderer.setScissorTest(true);
-
-    const objectsByModel = new Map<string, THREE.Object3D>();
-    for (const [modelId, model] of fragments.list) {
-      objectsByModel.set(modelId, model.object);
-    }
-    const bimRoots = new Set<THREE.Object3D>(objectsByModel.values());
-
-    const nonBimVisibility = new Map<THREE.Object3D, boolean>();
-    const inBimSubtree = (obj: THREE.Object3D) => {
-      let p: THREE.Object3D | null = obj;
-      while (p) {
-        if (bimRoots.has(p)) return true;
-        p = p.parent;
-      }
-      return false;
-    };
-    scene.traverse((child) => {
-      if (child === scene) return;
-      if (!(child as THREE.Mesh).isMesh) return;
-      if (inBimSubtree(child)) return;
-      nonBimVisibility.set(child, child.visible);
-      child.visible = false;
-    });
-
-    // A model is only pickable if it was actually on screen. Compute this
-    // before touching any visibility flag, and walk the full ancestor
-    // chain: a delta model is only visible if its parent model is too.
-    const wasOnScreen = new Map<string, boolean>();
-    for (const [modelId, obj] of objectsByModel) {
-      let visible = true;
-      let node: THREE.Object3D | null = obj;
-      while (node) {
-        if (!node.visible) {
-          visible = false;
-          break;
-        }
-        node = node.parent;
-      }
-      wasOnScreen.set(modelId, visible);
-    }
-
-    // Isolate models by their OWN meshes, not by their root. A delta
-    // model's object is a child of its parent model's object, so hiding
-    // the parent's root to render another model would cull the delta
-    // with it, and revealing the delta's root alone would still leave it
-    // culled by its hidden parent. Keeping every root visible and
-    // toggling owned meshes sidesteps both.
-    const rootVisibilityBefore = new Map<THREE.Object3D, boolean>();
-    for (const obj of objectsByModel.values()) {
-      rootVisibilityBefore.set(obj, obj.visible);
-      obj.visible = true;
-    }
-
-    const meshVisibilityBefore = new Map<THREE.Mesh, boolean>();
-    for (const meshes of this._ownMeshes.values()) {
-      for (const mesh of meshes) {
-        meshVisibilityBefore.set(mesh, mesh.visible);
-        mesh.visible = false;
-      }
-    }
-
-    for (const [byte, modelId] of byteToModel) {
-      if (!wasOnScreen.get(modelId)) continue;
-      const meshes = this._ownMeshes.get(modelId);
-      if (!meshes) continue;
-      // Restore each shell's own visibility rather than forcing it true:
-      // fragments flags stale LOD tiles invisible, and rasterizing those
-      // would leak geometry at the wrong depth into the pick.
-      for (const mesh of meshes) mesh.visible = meshVisibilityBefore.get(mesh)!;
-      material.uniforms.modelByte.value = byte;
+    const nonBimVisibility = this.hideNonBimMeshes(scene, fragments);
+    try {
+      (scene as THREE.Scene).background = null;
+      renderer.setRenderTarget(target);
+      renderer.setClearColor(0x000000, 0);
+      renderer.autoClear = false;
+      renderer.setScissorTest(false);
+      renderer.clear(true, true, false);
       renderer.render(scene, camera);
-      for (const mesh of meshes) mesh.visible = false;
+    } finally {
+      for (const [obj, was] of nonBimVisibility) obj.visible = was;
+      renderer.setRenderTarget(prevTarget);
+      renderer.setScissorTest(prevScissorTest);
+      renderer.setScissor(prevScissor);
+      renderer.autoClear = prevAutoClear;
+      renderer.setClearColor(prevClearColor, prevClearAlpha);
+      (scene as THREE.Scene).background = prevBackground;
     }
-
-    for (const [mesh, was] of meshVisibilityBefore) mesh.visible = was;
-    for (const [obj, was] of rootVisibilityBefore) obj.visible = was;
-    for (const [obj, was] of nonBimVisibility) obj.visible = was;
-
-    renderer.setScissorTest(prevScissorTest);
-    renderer.setScissor(prevScissor);
-    renderer.setRenderTarget(prevTarget);
-    renderer.autoClear = prevAutoClear;
-    renderer.setClearColor(prevClearColor, prevClearAlpha);
-    (scene as THREE.Scene).background = prevBackground;
   }
 
   /**
@@ -708,15 +624,18 @@ export class FastModelPicker implements Disposable {
    * `overrideMaterial` then renders nothing and we read back a
    * cleared pixel. Per-mesh swap mirrors what {@link renderIdPass}
    * does; we also force each shell visible for the duration of the
-   * render so fragments' culling decisions don't blank our output.
+   * render. The same cropped camera is shared with the identity pass.
    *
    * Honours the renderer's clipping planes so picked depth/normal
    * match what's actually rendered on screen.
    */
-  private renderWithTileMaterial(material: THREE.ShaderMaterial) {
+  private renderWithTileMaterial(
+    material: THREE.ShaderMaterial,
+    ndc: THREE.Vector2,
+  ) {
     const renderer = this.world.renderer!.three;
     const scene = this.world.scene.three;
-    const camera = this.world.camera.three;
+    const view = this.createPickView(ndc);
     const fragments = this.components.get(FragmentsManager);
 
     // Sync clipping planes onto the swap material.
@@ -728,6 +647,8 @@ export class FastModelPicker implements Disposable {
     const prevAutoClear = renderer.autoClear;
     const prevClearColor = renderer.getClearColor(new THREE.Color());
     const prevClearAlpha = renderer.getClearAlpha();
+    const prevScissorTest = renderer.getScissorTest();
+    const prevScissor = renderer.getScissor(new THREE.Vector4());
 
     // Same background caveat as renderPickPass: a non-null scene background
     // would force-clear our target mid-pass and, for the depth/normal reads,
@@ -735,8 +656,6 @@ export class FastModelPicker implements Disposable {
     // to a bogus point/normal instead of void. Null it for the render and
     // restore below (issues #737 / #773).
     const prevBackground = (scene as THREE.Scene).background;
-    (scene as THREE.Scene).background = null;
-
     // Per-mesh material + visibility swap. We only touch shells that
     // carry the `id` attribute — those are the BIM tile shells.
     // LOD-stage line meshes (no `id`) are hidden so they don't write
@@ -745,29 +664,25 @@ export class FastModelPicker implements Disposable {
     // hidden tiles visible leaks stale LOD-stage geometry into the
     // pick — those tiles sit at slightly different depths than the
     // active ones and would dominate `gl_FragCoord.z` at the cursor.
-    const matSwap = new Map<
-      THREE.Mesh,
-      THREE.Material | THREE.Material[]
-    >();
+    const matSwap = new Map<THREE.Mesh, THREE.Material | THREE.Material[]>();
     const hiddenLines: THREE.Object3D[] = [];
-    const modelRoots = this.getModelRoots();
     for (const [, model] of fragments.list) {
-      this.traverseOwn(model.object, modelRoots, (child) => {
-        if (!(child instanceof THREE.Mesh)) return;
+      for (const [, child] of model.tiles) {
+        if (!(child instanceof THREE.Mesh)) continue;
         const geom = child.geometry as THREE.BufferGeometry | undefined;
-        if (!geom) return;
+        if (!geom) continue;
         if (!geom.attributes || !geom.attributes.id) {
           if (child.visible) {
             hiddenLines.push(child);
             child.visible = false;
           }
-          return;
+          continue;
         }
         // Mirror the id pass: we only rasterize tiles fragments has
         // currently flagged visible. Forcing hidden tiles visible
         // would render stale LOD-stage geometry that sits at slightly
         // different depths than the active tiles.
-        if (!child.visible) return;
+        if (!child.visible) continue;
         matSwap.set(child, child.material);
         // Wrap in an array so three honours `geometry.groups` (per-item
         // visibility ranges). With a single Material, three draws the
@@ -777,53 +692,39 @@ export class FastModelPicker implements Disposable {
         // longer note in `applyIdMaterial`.
         const original = child.material;
         const len = Array.isArray(original) ? original.length : 1;
-        child.material = new Array(len).fill(material);
-      });
+        child.material = this.getMaterialArray(material, len);
+      }
     }
 
-    // Hide non-BIM meshes for the duration of the render.
-    const bimRoots = new Set<THREE.Object3D>();
-    for (const [, model] of fragments.list) bimRoots.add(model.object);
-    const inBimSubtree = (obj: THREE.Object3D) => {
-      let p: THREE.Object3D | null = obj;
-      while (p) {
-        if (bimRoots.has(p)) return true;
-        p = p.parent;
-      }
-      return false;
-    };
-    const nonBimVisibility = new Map<THREE.Object3D, boolean>();
-    scene.traverse((child) => {
-      if (child === scene) return;
-      if (!(child as THREE.Mesh).isMesh) return;
-      if (inBimSubtree(child)) return;
-      nonBimVisibility.set(child, child.visible);
-      child.visible = false;
-    });
-
-    renderer.setRenderTarget(this._renderTarget!);
-    renderer.setClearColor(0x000000, 0);
-    renderer.autoClear = false;
-    renderer.clear(true, true, false);
-    renderer.render(scene, camera);
-
-    // Restore everything.
-    for (const [mesh, mat] of matSwap) mesh.material = mat;
-    for (const obj of hiddenLines) obj.visible = true;
-    for (const [obj, was] of nonBimVisibility) obj.visible = was;
-
-    renderer.setRenderTarget(prevTarget);
-    renderer.autoClear = prevAutoClear;
-    renderer.setClearColor(prevClearColor, prevClearAlpha);
-    (scene as THREE.Scene).background = prevBackground;
+    const nonBimVisibility = this.hideNonBimMeshes(scene, fragments);
+    try {
+      (scene as THREE.Scene).background = null;
+      renderer.setRenderTarget(this._renderTarget!);
+      renderer.setClearColor(0x000000, 0);
+      renderer.autoClear = false;
+      renderer.setScissorTest(false);
+      renderer.clear(true, true, false);
+      renderer.render(scene, view.camera);
+    } finally {
+      for (const [mesh, mat] of matSwap) mesh.material = mat;
+      for (const obj of hiddenLines) obj.visible = true;
+      for (const [obj, was] of nonBimVisibility) obj.visible = was;
+      renderer.setRenderTarget(prevTarget);
+      renderer.setScissorTest(prevScissorTest);
+      renderer.setScissor(prevScissor);
+      renderer.autoClear = prevAutoClear;
+      renderer.setClearColor(prevClearColor, prevClearAlpha);
+      (scene as THREE.Scene).background = prevBackground;
+    }
+    return view;
   }
 
-  private renderDepthPass() {
-    this.renderWithTileMaterial(this._depthMaterial);
+  private renderDepthPass(ndc: THREE.Vector2) {
+    return this.renderWithTileMaterial(this._depthMaterial, ndc);
   }
 
-  private renderNormalPass() {
-    this.renderWithTileMaterial(this._normalMaterial);
+  private renderNormalPass(ndc: THREE.Vector2) {
+    return this.renderWithTileMaterial(this._normalMaterial, ndc);
   }
 
   private restoreOriginalMaterials() {
@@ -831,35 +732,61 @@ export class FastModelPicker implements Disposable {
       mesh.material = mat;
     }
     this._originalMaterials.clear();
-    this._ownMeshes.clear();
 
     for (const obj of this._hiddenLods) obj.visible = true;
     this._hiddenLods.length = 0;
   }
 
-  private readPixelAt(
-    targetOrNdc: THREE.WebGLRenderTarget | THREE.Vector2,
-    maybeNdc?: THREE.Vector2,
-  ): Uint8Array | null {
-    // Two call shapes — keep `readPixelAt(ndc)` working for the
-    // depth / normal helpers that read from the primary
-    // `_renderTarget`, plus a `readPixelAt(target, ndc)` form for
-    // the id / localId pass that needs to choose which target.
-    let target: THREE.WebGLRenderTarget;
-    let ndc: THREE.Vector2;
-    if (targetOrNdc instanceof THREE.WebGLRenderTarget) {
-      target = targetOrNdc;
-      ndc = maybeNdc!;
-    } else {
-      target = this._renderTarget!;
-      ndc = targetOrNdc;
+  private getIdMaterial(modelByte: number) {
+    const index = modelByte - 1;
+    let material = this._idMaterials[index];
+    if (!material) {
+      material = index === 0 ? this._idMaterial : this._idMaterial.clone();
+      this._idMaterials[index] = material;
     }
+    material.uniforms.modelByte.value = modelByte;
+    return material;
+  }
+
+  private getMaterialArray(material: THREE.Material, length: number) {
+    let byLength = this._materialArrays.get(material);
+    if (!byLength) {
+      byLength = new Map<number, THREE.Material[]>();
+      this._materialArrays.set(material, byLength);
+    }
+    let materials = byLength.get(length);
+    if (!materials) {
+      materials = new Array(length).fill(material);
+      byLength.set(length, materials);
+    }
+    return materials;
+  }
+
+  private hideNonBimMeshes(scene: THREE.Object3D, fragments: FragmentsManager) {
+    const modelRoots = new Set<THREE.Object3D>();
+    for (const [, model] of fragments.list) modelRoots.add(model.object);
+    const visibility = new Map<THREE.Object3D, boolean>();
+    const stack: THREE.Object3D[] = [scene];
+    while (stack.length) {
+      const node = stack.pop()!;
+      if (modelRoots.has(node)) continue;
+      if (node !== scene && (node as THREE.Mesh).isMesh) {
+        visibility.set(node, node.visible);
+        node.visible = false;
+      }
+      for (const child of node.children) stack.push(child);
+    }
+    return visibility;
+  }
+
+  private readPixelAt(
+    target: THREE.WebGLRenderTarget,
+    x: number,
+    y: number,
+  ): Uint8Array | null {
     const renderer = this.world.renderer!.three;
-    const size = this._renderTargetSize;
-    const x = Math.floor((ndc.x + 1) * 0.5 * size.x);
-    const y = Math.floor((ndc.y + 1) * 0.5 * (size.y - 1));
-    const cx = Math.max(0, Math.min(size.x - 1, x));
-    const cy = Math.max(0, Math.min(size.y - 1, y));
+    const cx = Math.max(0, Math.min(target.width - 1, Math.floor(x)));
+    const cy = Math.max(0, Math.min(target.height - 1, Math.floor(y)));
     const pixels = new Uint8Array(4);
     renderer.readRenderTargetPixels(target, cx, cy, 1, 1, pixels);
     return pixels;
@@ -1042,6 +969,14 @@ export class FastModelPicker implements Disposable {
     const renderer = this.world.renderer!.three;
     const size = renderer.getSize(new THREE.Vector2());
     this._renderTargetSize.copy(size);
+    const width = Math.min(
+      FastModelPicker.PICK_SIZE,
+      Math.max(1, Math.floor(size.x)),
+    );
+    const height = Math.min(
+      FastModelPicker.PICK_SIZE,
+      Math.max(1, Math.floor(size.y)),
+    );
 
     const opts: THREE.RenderTargetOptions = {
       format: THREE.RGBAFormat,
@@ -1050,23 +985,32 @@ export class FastModelPicker implements Disposable {
       magFilter: THREE.NearestFilter,
       depthBuffer: true,
     };
-    this._renderTarget = new THREE.WebGLRenderTarget(size.x, size.y, opts);
+    this._renderTarget = new THREE.WebGLRenderTarget(width, height, opts);
 
     if (this.debugMode) this.setupDebugCanvas();
 
     this.world.renderer!.onResize.add((newSize) => {
       this._renderTargetSize.copy(newSize);
-      this._renderTarget!.setSize(newSize.x, newSize.y);
+      const nextWidth = Math.min(
+        FastModelPicker.PICK_SIZE,
+        Math.max(1, Math.floor(newSize.x)),
+      );
+      const nextHeight = Math.min(
+        FastModelPicker.PICK_SIZE,
+        Math.max(1, Math.floor(newSize.y)),
+      );
+      this._renderTarget!.setSize(nextWidth, nextHeight);
       if (this._debugCanvas) {
-        this._debugCanvas.width = newSize.x;
-        this._debugCanvas.height = newSize.y;
+        this._debugCanvas.width = nextWidth;
+        this._debugCanvas.height = nextHeight;
       }
     });
   }
 
   private setupDebugCanvas() {
     if (this._debugCanvas) return;
-    const size = this.world.renderer!.three.getSize(new THREE.Vector2());
+    const width = this._renderTarget?.width ?? FastModelPicker.PICK_SIZE;
+    const height = this._renderTarget?.height ?? FastModelPicker.PICK_SIZE;
 
     this._debugContainer = document.createElement("div");
     this._debugContainer.style.position = "fixed";
@@ -1080,8 +1024,8 @@ export class FastModelPicker implements Disposable {
     this._debugContainer.style.pointerEvents = "none";
 
     this._debugCanvas = document.createElement("canvas");
-    this._debugCanvas.width = size.x;
-    this._debugCanvas.height = size.y;
+    this._debugCanvas.width = width;
+    this._debugCanvas.height = height;
     this._debugCanvas.style.width = "100%";
     this._debugCanvas.style.height = "100%";
     this._debugCanvas.style.imageRendering = "pixelated";
@@ -1102,26 +1046,27 @@ export class FastModelPicker implements Disposable {
       return;
     }
     const renderer = this.world.renderer.three;
-    const size = this._renderTargetSize;
+    const width = this._renderTarget.width;
+    const height = this._renderTarget.height;
 
-    const pixels = new Uint8Array(size.x * size.y * 4);
+    const pixels = new Uint8Array(width * height * 4);
     renderer.readRenderTargetPixels(
       this._renderTarget,
       0,
       0,
-      size.x,
-      size.y,
+      width,
+      height,
       pixels,
     );
 
     const ctx = this._debugCanvas.getContext("2d");
     if (!ctx) return;
-    const imageData = ctx.createImageData(size.x, size.y);
+    const imageData = ctx.createImageData(width, height);
     // Flip Y axis: WebGL has Y=0 at bottom, canvas 2D has Y=0 at top.
-    const rowSize = size.x * 4;
-    for (let y = 0; y < size.y; y++) {
+    const rowSize = width * 4;
+    for (let y = 0; y < height; y++) {
       const srcRow = y;
-      const dstRow = size.y - 1 - y;
+      const dstRow = height - 1 - y;
       const srcOffset = srcRow * rowSize;
       const dstOffset = dstRow * rowSize;
       imageData.data.set(
@@ -1149,10 +1094,7 @@ function unpackDepthFromRGBA(pixels: Uint8Array): number {
   const b = pixels[2] / 255;
   const a = pixels[3] / 255;
   const downscale = 255 / 256;
-  return (
-    downscale *
-    (r / (256 * 256 * 256) + g / (256 * 256) + b / 256 + a)
-  );
+  return downscale * (r / (256 * 256 * 256) + g / (256 * 256) + b / 256 + a);
 }
 
 /**
@@ -1169,4 +1111,3 @@ function unprojectToWorld(
   v.unproject(camera);
   return v;
 }
-
