@@ -1,8 +1,18 @@
 import * as OBC from "@thatopen/components";
 import * as THREE from "three";
-import { DataSet } from "@thatopen/fragments";
+import { DataSet, type FragmentsModel } from "@thatopen/fragments";
 import { Highlighter } from "../Highlighter";
 import { PostproductionRenderer } from "../../core";
+
+class OutlinerUpdateError extends Error {
+  readonly errors: unknown[];
+
+  constructor(errors: unknown[]) {
+    super("Unable to update Fragments outlines.");
+    this.name = "OutlinerUpdateError";
+    this.errors = errors;
+  }
+}
 
 const DEFAULT_GROUP = "default";
 
@@ -174,7 +184,14 @@ export class Outliner extends OBC.Component implements OBC.Disposable {
    * registered in {@link bindModelTileEvents}. Run on dispose so we
    * don't leak references after the Outliner goes away.
    */
-  private _tileListeners = new Map<string, () => void>();
+  private _tileListeners = new Map<
+    string,
+    { model: FragmentsModel; unbind: () => void }
+  >();
+  private _pendingUpdates = new Set<Promise<unknown>>();
+  private _backgroundErrors: unknown[] = [];
+  private _updateRevisions = new Map<string, number>();
+  private _modelEventsUnbind: (() => void) | null = null;
 
   constructor(components: OBC.Components) {
     super(components);
@@ -234,6 +251,7 @@ export class Outliner extends OBC.Component implements OBC.Disposable {
       }
     }
 
+    this.invalidateGroup(name);
     this.detachAll(group, name);
     this._groups.delete(name);
 
@@ -297,6 +315,17 @@ export class Outliner extends OBC.Component implements OBC.Disposable {
     }
   }
 
+  /** Waits for automatic tile and model lifecycle outline updates to settle. */
+  async whenSettled() {
+    while (this._pendingUpdates.size > 0) {
+      await Promise.allSettled([...this._pendingUpdates]);
+    }
+    if (this._backgroundErrors.length > 0) {
+      const errors = this._backgroundErrors.splice(0);
+      throw new OutlinerUpdateError(errors);
+    }
+  }
+
   // ---------------------------------------------------------------------------
   // Cleanup
   // ---------------------------------------------------------------------------
@@ -309,6 +338,7 @@ export class Outliner extends OBC.Component implements OBC.Disposable {
     if (group !== undefined) {
       const state = this._groups.get(group);
       if (!state) return;
+      this.invalidateGroup(group);
       state.map = {};
       state.activeStyles.clear();
       this.detachAll(state, group);
@@ -317,6 +347,7 @@ export class Outliner extends OBC.Component implements OBC.Disposable {
     }
 
     for (const [name, state] of this._groups) {
+      this.invalidateGroup(name);
       state.map = {};
       state.activeStyles.clear();
       this.detachAll(state, name);
@@ -327,7 +358,11 @@ export class Outliner extends OBC.Component implements OBC.Disposable {
   /** {@link Disposable.dispose} */
   dispose() {
     this.styles.clear();
-    for (const [, unbind] of this._tileListeners) unbind();
+    if (this._modelEventsUnbind) {
+      this._modelEventsUnbind();
+      this._modelEventsUnbind = null;
+    }
+    for (const [, listener] of this._tileListeners) listener.unbind();
     this._tileListeners.clear();
     for (const name of [...this._groups.keys()]) {
       if (name === DEFAULT_GROUP) continue;
@@ -452,7 +487,17 @@ export class Outliner extends OBC.Component implements OBC.Disposable {
    * Outline color, fill, and thickness come from the pass's group config.
    * The Outliner only feeds it the geometry slices.
    */
-  private async updateGroup(name: string, _delta?: OBC.ModelIdMap) {
+  private updateGroup(name: string, delta?: OBC.ModelIdMap) {
+    const revision = (this._updateRevisions.get(name) ?? 0) + 1;
+    this._updateRevisions.set(name, revision);
+    return this.trackUpdate(this.performGroupUpdate(name, delta, revision));
+  }
+
+  private async performGroupUpdate(
+    name: string,
+    _delta: OBC.ModelIdMap | undefined,
+    revision: number,
+  ) {
     const state = this.ensureGroup(name);
     if (!this.world) return;
     const renderer = this.getRenderer();
@@ -464,6 +509,7 @@ export class Outliner extends OBC.Component implements OBC.Disposable {
 
     if (name === DEFAULT_GROUP && this.outlinePositions) {
       await this.updatePoints();
+      if (!this.isGroupUpdateCurrent(name, state, revision)) return;
     }
 
     const fragments = this.components.get(OBC.FragmentsManager);
@@ -481,6 +527,7 @@ export class Outliner extends OBC.Component implements OBC.Disposable {
     const queries: Array<
       Promise<{
         modelId: string;
+        model: FragmentsModel;
         chunks: Array<{
           tileId: number;
           position: Uint32Array;
@@ -490,36 +537,35 @@ export class Outliner extends OBC.Component implements OBC.Disposable {
     > = [];
     for (const [modelId, localIds] of Object.entries(map)) {
       if (localIds.size === 0) continue;
+      this.bindModelTileEvents(modelId);
       const model = fragments.list.get(modelId);
       if (!model) continue;
-      this.bindModelTileEvents(modelId);
       queries.push(
         (async () => {
           // `getItemDrawChunks` accepts an iterable; we pass the Set
           // straight through to avoid materializing an array for very
           // large selections.
-          const chunks = (await (model as any).getItemDrawChunks(
-            localIds,
-          )) as Array<{
+          const chunks = (await model.getItemDrawChunks(localIds)) as Array<{
             tileId: number;
             position: Uint32Array;
             size: Uint32Array;
           }>;
-          return { modelId, chunks };
+          return { modelId, model, chunks };
         })(),
       );
     }
 
     const results = await Promise.all(queries);
+    if (!this.isGroupUpdateCurrent(name, state, revision)) return;
 
     // Attach (or refresh) every tile that came back; track attachments
     // for next-time diffs.
-    for (const { modelId, chunks } of results) {
-      const model = fragments.list.get(modelId);
-      if (!model) continue;
+    for (const { modelId, model: queriedModel, chunks } of results) {
+      const currentModel = fragments.list.get(modelId);
+      if (currentModel !== queriedModel) continue;
       const attached = new Set<THREE.Mesh>();
       for (const entry of chunks) {
-        const tile = model.tiles.get(entry.tileId);
+        const tile = currentModel.tiles.get(entry.tileId);
         if (!tile) continue;
         pass.attachOutlinedTile(
           tile,
@@ -544,6 +590,36 @@ export class Outliner extends OBC.Component implements OBC.Disposable {
     state.attached = nextAttached;
   }
 
+  private isGroupUpdateCurrent(
+    name: string,
+    state: OutlineGroupState,
+    revision: number,
+  ) {
+    return (
+      this._groups.get(name) === state &&
+      this._updateRevisions.get(name) === revision
+    );
+  }
+
+  private invalidateGroup(name: string) {
+    this._updateRevisions.set(name, (this._updateRevisions.get(name) ?? 0) + 1);
+  }
+
+  private trackUpdate<T>(update: Promise<T>): Promise<T> {
+    this._pendingUpdates.add(update);
+    const remove = () => this._pendingUpdates.delete(update);
+    return update.then(
+      (value) => {
+        remove();
+        return value;
+      },
+      (error) => {
+        remove();
+        throw error;
+      },
+    );
+  }
+
   /**
    * Detach every proxy this group has attached and clear the tracking
    * map. Used by `clean` and `remove`.
@@ -566,26 +642,57 @@ export class Outliner extends OBC.Component implements OBC.Disposable {
    * or unload. Idempotent per model id.
    */
   private bindModelTileEvents(modelId: string) {
-    if (this._tileListeners.has(modelId)) return;
+    this.ensureModelEvents();
     const fragments = this.components.get(OBC.FragmentsManager);
     const model = fragments.list.get(modelId);
+    const existing = this._tileListeners.get(modelId);
+    if (existing && existing.model === model) return;
+    if (existing) {
+      existing.unbind();
+      this._tileListeners.delete(modelId);
+    }
     if (!model) return;
     const refresh = () => {
-      // Re-sync any group whose selection still references this model.
-      // Cheap for groups that don't.
-      for (const [groupName, state] of this._groups) {
-        const localIds = state.map[modelId];
-        if (localIds && localIds.size > 0) {
-          this.updateGroup(groupName).catch(() => undefined);
-        }
-      }
+      this.refreshModel(modelId);
     };
     model.tiles.onItemSet.add(refresh);
     model.tiles.onItemDeleted.add(refresh);
-    this._tileListeners.set(modelId, () => {
-      model.tiles.onItemSet.remove(refresh);
-      model.tiles.onItemDeleted.remove(refresh);
+    this._tileListeners.set(modelId, {
+      model,
+      unbind: () => {
+        model.tiles.onItemSet.remove(refresh);
+        model.tiles.onItemDeleted.remove(refresh);
+      },
     });
+  }
+
+  private ensureModelEvents() {
+    if (this._modelEventsUnbind) return;
+    const models = this.components.get(OBC.FragmentsManager).list;
+    const onSet = ({ key }: { key: string }) => this.refreshModel(key);
+    const onDeleted = (key: string) => this.refreshModel(key);
+    models.onItemSet.add(onSet);
+    models.onItemUpdated.add(onSet);
+    models.onItemDeleted.add(onDeleted);
+    this._modelEventsUnbind = () => {
+      models.onItemSet.remove(onSet);
+      models.onItemUpdated.remove(onSet);
+      models.onItemDeleted.remove(onDeleted);
+    };
+  }
+
+  private refreshModel(modelId: string) {
+    this.bindModelTileEvents(modelId);
+    for (const [groupName, state] of this._groups) {
+      const localIds = state.map[modelId];
+      if (localIds && localIds.size > 0) {
+        this.trackUpdate(
+          this.updateGroup(groupName).catch((error) => {
+            this._backgroundErrors.push(error);
+          }),
+        );
+      }
+    }
   }
 
   private cleanPoints() {
