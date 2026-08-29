@@ -20,8 +20,8 @@ interface OutlineGroup {
   fillOpacity: number;
   thickness: number;
   /**
-   * Higher priority wins at coplanar pixels. Applied as a polygon-offset bias
-   * on the group's material so depth test resolves ties in its favor.
+   * Higher priority wins at coplanar pixels. Groups render in priority order;
+   * the default less-equal depth test lets the later group resolve the tie.
    */
   priority: number;
 }
@@ -73,9 +73,9 @@ const GHOST_FRAG = `
  * the mask target in one `renderer.render(rootScene, camera)` call.
  *
  * A composite shader reads the mask (center pixel id), applies that group's
- * fill via a palette texture, then samples the neighborhood within the
- * group's thickness to paint an inward outline wherever the center is near a
- * different id.
+ * fill only where the selected depth matches the rendered scene, then samples
+ * the x-ray mask neighborhood within the group's thickness to paint an inward
+ * outline wherever the center is near a different id.
  *
  * Legacy single-outline API (`outlineColor`, `thickness`, `fillColor`,
  * `fillOpacity`, `scene`) is preserved as a delegate to the "default" group.
@@ -84,9 +84,12 @@ export class SimpleOutlinePass extends Pass {
   debugShowMask = false;
 
   private _world: OBC.World;
+  private _getSceneDepthTexture: () => THREE.DepthTexture | null;
   private _maskTarget: THREE.WebGLRenderTarget;
+  private _compositeTarget: THREE.WebGLRenderTarget | null = null;
   private _rootScene: THREE.Scene;
   private _fsQuad: FullScreenQuad;
+  private _copyQuad: FullScreenQuad;
   private _debugQuad: FullScreenQuad;
 
   private _groups = new Map<string, OutlineGroup>();
@@ -104,16 +107,26 @@ export class SimpleOutlinePass extends Pass {
   private _paletteData: Uint8Array;
   private _paletteTexture: THREE.DataTexture;
 
-  constructor(width: number, height: number, world: OBC.World) {
+  constructor(
+    width: number,
+    height: number,
+    world: OBC.World,
+    getSceneDepthTexture: () => THREE.DepthTexture | null,
+    reversedDepth: boolean,
+  ) {
     super();
     this._world = world;
+    this._getSceneDepthTexture = getSceneDepthTexture;
 
+    const selectedDepthTexture = new THREE.DepthTexture(width, height);
+    if (reversedDepth) selectedDepthTexture.type = THREE.FloatType;
     this._maskTarget = new THREE.WebGLRenderTarget(width, height, {
       minFilter: THREE.NearestFilter,
       magFilter: THREE.NearestFilter,
       format: THREE.RGBAFormat,
       type: THREE.UnsignedByteType,
       depthBuffer: true,
+      depthTexture: selectedDepthTexture,
     });
 
     this._rootScene = new THREE.Scene();
@@ -138,9 +151,13 @@ export class SimpleOutlinePass extends Pass {
         uniforms: {
           tDiffuse: { value: null },
           tMask: { value: null },
+          tSelectedDepth: { value: null },
+          tSceneDepth: { value: null },
           tPalette: { value: this._paletteTexture },
           resolution: { value: new THREE.Vector2(width, height) },
           maxThickness: { value: this._maxThickness },
+          hasSceneDepth: { value: false },
+          reversedDepth: { value: false },
         },
         vertexShader: `
           varying vec2 vUv;
@@ -155,9 +172,13 @@ export class SimpleOutlinePass extends Pass {
 
           uniform sampler2D tDiffuse;
           uniform sampler2D tMask;
+          uniform sampler2D tSelectedDepth;
+          uniform sampler2D tSceneDepth;
           uniform sampler2D tPalette;
           uniform vec2 resolution;
           uniform float maxThickness;
+          uniform bool hasSceneDepth;
+          uniform bool reversedDepth;
 
           // Palette is 256x2. y=0.25 (row 0) line, y=0.75 (row 1) fill.
           vec4 paletteLine(float id) {
@@ -171,9 +192,20 @@ export class SimpleOutlinePass extends Pass {
             return floor(texture2D(tMask, uv).r * 255.0 + 0.5);
           }
 
+          float isSelectedDepthVisible(float selectedDepth, float sceneDepth) {
+            float epsilon = reversedDepth
+              ? max(abs(sceneDepth) * 0.000001, 0.000000000001)
+              : 1.0 / 16777216.0;
+            if (reversedDepth) {
+              return selectedDepth + epsilon >= sceneDepth ? 1.0 : 0.0;
+            }
+            return selectedDepth <= sceneDepth + epsilon ? 1.0 : 0.0;
+          }
+
           void main() {
             vec4 scene = texture2D(tDiffuse, vUv);
-            float centerId = readId(vUv);
+            vec4 mask = texture2D(tMask, vUv);
+            float centerId = floor(mask.r * 255.0 + 0.5);
 
             if (centerId < 0.5) {
               gl_FragColor = scene;
@@ -190,7 +222,13 @@ export class SimpleOutlinePass extends Pass {
             float t = line.a * 255.0;
             vec2 texel = 1.0 / resolution;
 
-            vec3 rgb = mix(scene.rgb, fill.rgb, fill.a);
+            float selectedDepth = texture2D(tSelectedDepth, vUv).x;
+            float fillVisibility = 0.0;
+            if (hasSceneDepth) {
+              float sceneDepth = texture2D(tSceneDepth, vUv).x;
+              fillVisibility = isSelectedDepthVisible(selectedDepth, sceneDepth);
+            }
+            vec3 rgb = mix(scene.rgb, fill.rgb, fill.a * fillVisibility);
 
             float edge = 0.0;
             for (float y = -maxThickness; y <= maxThickness; y += 1.0) {
@@ -207,6 +245,30 @@ export class SimpleOutlinePass extends Pass {
             gl_FragColor = vec4(rgb, 1.0);
           }
         `,
+        depthTest: false,
+        depthWrite: false,
+      }),
+    );
+
+    this._copyQuad = new FullScreenQuad(
+      new THREE.ShaderMaterial({
+        uniforms: { tDiffuse: { value: null } },
+        vertexShader: `
+          varying vec2 vUv;
+          void main() {
+            vUv = uv;
+            gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0);
+          }
+        `,
+        fragmentShader: `
+          uniform sampler2D tDiffuse;
+          varying vec2 vUv;
+          void main() {
+            gl_FragColor = texture2D(tDiffuse, vUv);
+          }
+        `,
+        depthTest: false,
+        depthWrite: false,
       }),
     );
 
@@ -272,9 +334,6 @@ export class SimpleOutlinePass extends Pass {
       depthTest: true,
       depthWrite: true,
       transparent: false,
-      polygonOffset: priority !== 0,
-      polygonOffsetFactor: -priority,
-      polygonOffsetUnits: -priority,
     });
 
     const container = new THREE.Group();
@@ -314,13 +373,11 @@ export class SimpleOutlinePass extends Pass {
     if (!group) return;
     if (config.outlineColor) group.outlineColor.copy(config.outlineColor);
     if (config.fillColor) group.fillColor.copy(config.fillColor);
-    if (config.fillOpacity !== undefined) group.fillOpacity = config.fillOpacity;
+    if (config.fillOpacity !== undefined)
+      group.fillOpacity = config.fillOpacity;
     if (config.thickness !== undefined) group.thickness = config.thickness;
     if (config.priority !== undefined) {
       group.priority = config.priority;
-      group.material.polygonOffset = config.priority !== 0;
-      group.material.polygonOffsetFactor = -config.priority;
-      group.material.polygonOffsetUnits = -config.priority;
       group.container.renderOrder = config.priority;
     }
     this.writePaletteEntry(group);
@@ -542,6 +599,7 @@ export class SimpleOutlinePass extends Pass {
 
   setSize(width: number, height: number) {
     this._maskTarget.setSize(width, height);
+    this._compositeTarget?.setSize(width, height);
     const mat = this._fsQuad.material as THREE.ShaderMaterial;
     mat.uniforms.resolution.value.set(width, height);
   }
@@ -571,8 +629,8 @@ export class SimpleOutlinePass extends Pass {
 
     // Single draw of all groups. Each ghost mesh already holds its group's
     // material with the right id baked in; three.js sorts and batches the
-    // draws, and the shared depth buffer gives "closer outlined item wins"
-    // across groups.
+    // draws, the shared depth buffer gives "closer outlined item wins", and
+    // renderOrder settles exact coplanar ties by group priority.
     renderer.render(this._rootScene, camera);
 
     renderer.setClearColor(prevClearColor, prevClearAlpha);
@@ -588,24 +646,52 @@ export class SimpleOutlinePass extends Pass {
     }
 
     const mat = this._fsQuad.material as THREE.ShaderMaterial;
+    const sceneDepthTexture = this._getSceneDepthTexture();
     mat.uniforms.tDiffuse.value = readBuffer.texture;
     mat.uniforms.tMask.value = this._maskTarget.texture;
+    mat.uniforms.tSelectedDepth.value = this._maskTarget.depthTexture;
+    mat.uniforms.tSceneDepth.value = sceneDepthTexture;
     mat.uniforms.maxThickness.value = this._maxThickness;
+    mat.uniforms.hasSceneDepth.value = sceneDepthTexture !== null;
+    mat.uniforms.reversedDepth.value =
+      (
+        renderer.capabilities as THREE.WebGLRenderer["capabilities"] & {
+          reversedDepthBuffer?: boolean;
+        }
+      ).reversedDepthBuffer === true;
 
-    if (this.renderToScreen) renderer.setRenderTarget(null);
-    else renderer.setRenderTarget(writeBuffer);
+    const sceneDepthAliasesOutput = this.shouldStageComposite(
+      sceneDepthTexture,
+      writeBuffer,
+    );
+    const compositeTarget = sceneDepthAliasesOutput
+      ? this.getCompositeTarget(writeBuffer)
+      : this.renderToScreen
+        ? null
+        : writeBuffer;
+    renderer.setRenderTarget(compositeTarget);
     this._fsQuad.render(renderer);
+
+    if (sceneDepthAliasesOutput) {
+      const copyMat = this._copyQuad.material as THREE.ShaderMaterial;
+      copyMat.uniforms.tDiffuse.value = compositeTarget!.texture;
+      renderer.setRenderTarget(writeBuffer);
+      this._copyQuad.render(renderer);
+    }
   }
 
   dispose() {
     // FullScreenQuad.dispose() only disposes its internal geometry; the
     // materials we passed in are our responsibility.
     (this._fsQuad.material as THREE.Material).dispose();
+    (this._copyQuad.material as THREE.Material).dispose();
     (this._debugQuad.material as THREE.Material).dispose();
     this._fsQuad.dispose();
+    this._copyQuad.dispose();
     this._debugQuad.dispose();
 
     this._maskTarget.dispose();
+    this._compositeTarget?.dispose();
     this._paletteTexture.dispose();
 
     // Drop proxies but never call `proxy.geometry.dispose()`: see the
@@ -625,6 +711,29 @@ export class SimpleOutlinePass extends Pass {
     }
     this._groups.clear();
     this._groupsById.clear();
+  }
+
+  private shouldStageComposite(
+    sceneDepthTexture: THREE.DepthTexture | null,
+    writeBuffer: THREE.WebGLRenderTarget,
+  ) {
+    return (
+      !this.renderToScreen &&
+      sceneDepthTexture !== null &&
+      sceneDepthTexture === writeBuffer.depthTexture
+    );
+  }
+
+  private getCompositeTarget(template: THREE.WebGLRenderTarget) {
+    if (this._compositeTarget) return this._compositeTarget;
+    const target = template.clone();
+    target.depthTexture?.dispose();
+    target.depthTexture = null;
+    target.depthBuffer = false;
+    target.stencilBuffer = false;
+    target.texture.name = "SimpleOutlinePass.composite";
+    this._compositeTarget = target;
+    return target;
   }
 
   /**
@@ -673,8 +782,7 @@ export class SimpleOutlinePass extends Pass {
     const lineOffset = id * 4;
     const fillOffset = (PALETTE_SIZE + id) * 4;
     const data = this._paletteData;
-    const clampByte = (v: number) =>
-      Math.max(0, Math.min(255, Math.round(v)));
+    const clampByte = (v: number) => Math.max(0, Math.min(255, Math.round(v)));
 
     data[lineOffset] = clampByte(group.outlineColor.r * 255);
     data[lineOffset + 1] = clampByte(group.outlineColor.g * 255);

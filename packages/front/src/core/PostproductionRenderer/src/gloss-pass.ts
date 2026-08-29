@@ -19,6 +19,10 @@ export class GlossPass extends Pass {
   glossBuffer: THREE.WebGLRenderTarget;
 
   private _glossEnabled = true;
+  private _onSceneDepthRendered?: (
+    depthTexture: THREE.DepthTexture | null,
+  ) => void;
+  private _reversedDepth: boolean;
 
   get glossEnabled() {
     return this._glossEnabled;
@@ -88,6 +92,12 @@ export class GlossPass extends Pass {
     this.renderScene = world.scene.three as THREE.Scene;
     this.renderCamera = world.camera.three;
     this.resolution = new THREE.Vector2(resolution.x, resolution.y);
+    this._reversedDepth =
+      (
+        world.renderer?.three.capabilities as
+          | { reversedDepthBuffer?: boolean }
+          | undefined
+      )?.reversedDepthBuffer === true;
 
     this.fsQuad = new FullScreenQuad();
     this.fsQuad.material = this.createGlossMaterial();
@@ -97,6 +107,12 @@ export class GlossPass extends Pass {
     const glossMaterial = getProjectedNormalMaterial();
     // Note: clippingPlanes would need to be set separately if needed
     this.glossOverrideMaterial = glossMaterial;
+  }
+
+  setSceneDepthObserver(
+    observer: (depthTexture: THREE.DepthTexture | null) => void,
+  ) {
+    this._onSceneDepthRendered = observer;
   }
 
   dispose() {
@@ -131,6 +147,7 @@ export class GlossPass extends Pass {
     renderer.setRenderTarget(this.glossBuffer);
     this.renderScene.overrideMaterial = this.glossOverrideMaterial;
     renderer.render(this.renderScene, this.renderCamera);
+    this._onSceneDepthRendered?.(this.glossBuffer.depthTexture);
 
     this.renderScene.overrideMaterial = previousOverrideMaterial;
     this.renderScene.background = previousBackground;
@@ -240,6 +257,12 @@ export class GlossPass extends Pass {
     renderTarget.texture.magFilter = THREE.NearestFilter;
     renderTarget.texture.generateMipmaps = false;
     renderTarget.stencilBuffer = false;
+    const depthTexture = new THREE.DepthTexture(
+      this.resolution.x,
+      this.resolution.y,
+    );
+    if (this._reversedDepth) depthTexture.type = THREE.FloatType;
+    renderTarget.depthTexture = depthTexture;
     return renderTarget;
   }
 }

@@ -5,6 +5,9 @@ import { GTAOPass } from "three/examples/jsm/postprocessing/GTAOPass.js";
 export class AOPass extends GTAOPass {
   private _fragments: OBC.FragmentsManager;
   private _hiddenMaterials: Map<THREE.Material, boolean> = new Map();
+  private _onSceneDepthRendered?: (
+    depthTexture: THREE.DepthTexture | null,
+  ) => void;
 
   constructor(
     fragments: OBC.FragmentsManager,
@@ -17,6 +20,12 @@ export class AOPass extends GTAOPass {
     this._fragments = fragments;
   }
 
+  setSceneDepthObserver(
+    observer: (depthTexture: THREE.DepthTexture | null) => void,
+  ) {
+    this._onSceneDepthRendered = observer;
+  }
+
   render(
     renderer: THREE.WebGLRenderer,
     writeBuffer: THREE.WebGLRenderTarget,
@@ -27,6 +36,7 @@ export class AOPass extends GTAOPass {
     this._hideLodMaterials();
     super.render(renderer, writeBuffer, readBuffer, deltaTime, maskActive);
     this._restoreLodMaterials();
+    this._onSceneDepthRendered?.(this.depthTexture);
   }
 
   private _hideLodMaterials() {

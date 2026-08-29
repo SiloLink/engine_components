@@ -51,6 +51,16 @@ export class Postproduction {
   private _components: OBC.Components;
   private _renderer: PostproductionRenderer;
   private _clearColor = new THREE.Color();
+  private _sceneDepthTexture: THREE.DepthTexture | null = null;
+
+  // Keep the latest unbiased scene render for the outline fill. EdgeDetection
+  // deliberately biases geometry depth to resolve coplanar edge priority, so
+  // it must never replace the visibility authority captured here.
+  private readonly captureSceneDepth = (
+    depthTexture: THREE.DepthTexture | null,
+  ) => {
+    this._sceneDepthTexture = depthTexture;
+  };
 
   defaultAoParameters = {
     radius: 0.25,
@@ -311,6 +321,7 @@ export class Postproduction {
     renderer.clear();
     renderer.setRenderTarget(null);
     renderer.setClearColor(this._clearColor, prevClearAlpha);
+    this._sceneDepthTexture = null;
     this.composer.render();
     for (const material of this.invisibleMaterials) {
       material.visible = material.userData.wasVisibleForPostproduction;
@@ -379,9 +390,20 @@ export class Postproduction {
     // Configure renderer for transparency
     this._renderer.three.setClearColor(0x000000, 0);
 
+    const reversedDepth =
+      (this._renderer.three.capabilities as { reversedDepthBuffer?: boolean })
+        .reversedDepthBuffer === true;
     this.composer = new EffectComposer(this._renderer.three);
+    this.attachComposerDepthTextures(reversedDepth);
 
-    const basePass = new BasePass(scene, camera);
+    const basePass = new BasePass(
+      scene,
+      camera,
+      null,
+      null,
+      null,
+      this.captureSceneDepth,
+    );
     this._basePass = basePass;
 
     this._smaaPass = new SMAAPass();
@@ -395,6 +417,7 @@ export class Postproduction {
       this._renderer.three.domElement.width,
       this._renderer.three.domElement.height,
     );
+    this._aoPass.setSceneDepthObserver(this.captureSceneDepth);
     this._aoPass.output = GTAOPass.OUTPUT.Default;
     this._edgeDetectionPass = new EdgeDetectionPass(
       this._renderer,
@@ -407,6 +430,8 @@ export class Postproduction {
       this._renderer.three.domElement.width,
       this._renderer.three.domElement.height,
       this._renderer.currentWorld!,
+      () => this._sceneDepthTexture,
+      reversedDepth,
     );
 
     this._excludedObjectsPass = new ExcludedObjectsPass(
@@ -421,7 +446,20 @@ export class Postproduction {
       ),
       this._renderer.currentWorld!,
     );
+    this._glossPass.setSceneDepthObserver(this.captureSceneDepth);
 
     this.style = PostproductionAspect.COLOR;
+  }
+
+  private attachComposerDepthTextures(reversedDepth: boolean) {
+    if (!this.composer) return;
+    for (const target of [
+      this.composer.renderTarget1,
+      this.composer.renderTarget2,
+    ]) {
+      const depthTexture = new THREE.DepthTexture(target.width, target.height);
+      if (reversedDepth) depthTexture.type = THREE.FloatType;
+      target.depthTexture = depthTexture;
+    }
   }
 }

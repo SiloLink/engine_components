@@ -15,6 +15,9 @@ export class BasePass extends Pass {
   isolatedMaterials: THREE.Material[] = [];
 
   private _oldClearColor: THREE.Color;
+  private _onSceneDepthRendered: (
+    depthTexture: THREE.DepthTexture | null,
+  ) => void;
 
   constructor(
     scene: THREE.Scene,
@@ -22,6 +25,7 @@ export class BasePass extends Pass {
     overrideMaterial = null,
     clearColor = null,
     clearAlpha = null,
+    onSceneDepthRendered: (depthTexture: THREE.DepthTexture | null) => void,
   ) {
     super();
 
@@ -38,6 +42,7 @@ export class BasePass extends Pass {
     this.clear = true;
 
     this.clearDepth = false;
+    this._onSceneDepthRendered = onSceneDepthRendered;
 
     this.needsSwap = false;
     this._oldClearColor = new THREE.Color();
@@ -94,6 +99,7 @@ export class BasePass extends Pass {
     }
 
     renderer.render(this.scene, this.camera);
+    this._onSceneDepthRendered(readBuffer.depthTexture);
 
     // restore
 
