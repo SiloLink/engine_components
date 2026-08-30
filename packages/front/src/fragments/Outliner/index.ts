@@ -34,6 +34,7 @@ export interface OutlineGroupConfig {
 
 interface OutlineGroupState {
   map: OBC.ModelIdMap;
+  config: OutlineGroupConfig;
   /**
    * Tile meshes currently attached as outline proxies for this group,
    * grouped by model id. Used to diff against subsequent chunk queries
@@ -58,17 +59,66 @@ interface OutlineGroupState {
  */
 export class Outliner extends OBC.Component implements OBC.Disposable {
   private _world?: OBC.World;
+  // Keep the pass we actually populated. A renderer can replace its
+  // postproduction instance before the Outliner receives a new world.
+  private _outlinePass:
+    | PostproductionRenderer["postproduction"]["outlinePass"]
+    | null = null;
 
   /**
    * The world where the outliner operates.
    */
   set world(value: OBC.World | undefined) {
+    const nextPass = value
+      ? this.getRenderer(value).postproduction.outlinePass
+      : null;
+    if (value === this._world && nextPass === this._outlinePass) return;
+
+    const previousPass = this._outlinePass;
+    if (previousPass) {
+      for (const [name, state] of this._groups) {
+        const passGroup = previousPass.getGroup(name);
+        if (passGroup) {
+          state.config = {
+            color: passGroup.outlineColor.clone(),
+            fillColor: passGroup.fillColor.clone(),
+            fillOpacity: passGroup.fillOpacity,
+            thickness: passGroup.thickness,
+            priority: passGroup.priority,
+          };
+        }
+
+        this.invalidateGroup(name);
+        this.detachAllFromPass(state, name, previousPass);
+        if (name !== DEFAULT_GROUP) previousPass.removeGroup(name);
+      }
+
+      if (this._mesh && this._pointsExclusionPass) {
+        this._pointsExclusionPass.removeExcludedMaterial(this._mesh.material);
+      }
+      this._pointsExclusionPass = null;
+      this._mesh?.removeFromParent();
+    }
+
     this._world = value;
+    this._outlinePass = nextPass;
     if (!value) return;
-    const renderer = this.getRenderer();
-    renderer.postproduction.excludedObjectsPass.addExcludedMaterial(
-      this._points.material,
-    );
+    const points = this.ensurePoints();
+    if (this.outlinePositions && this.enabled) {
+      value.scene.three.add(points);
+    }
+
+    const pass = nextPass!;
+    for (const [name, state] of this._groups) {
+      pass.addGroup(name, this.toPassConfig(state.config));
+      const hasItems = Object.values(state.map).some(
+        (localIds) => localIds.size > 0,
+      );
+      if (!hasItems) continue;
+      this.updateGroup(name).catch((error) => {
+        this._backgroundErrors.push(error);
+      });
+    }
   }
 
   get world() {
@@ -91,8 +141,15 @@ export class Outliner extends OBC.Component implements OBC.Disposable {
     THREE.BufferGeometry,
     THREE.PointsMaterial
   > | null = null;
+  private _pointsExclusionPass:
+    | PostproductionRenderer["postproduction"]["excludedObjectsPass"]
+    | null = null;
 
   private get _points() {
+    return this.ensurePoints();
+  }
+
+  private ensurePoints() {
     if (!this._mesh) {
       this._mesh = new THREE.Points(
         new THREE.BufferGeometry(),
@@ -102,6 +159,14 @@ export class Outliner extends OBC.Component implements OBC.Disposable {
           depthTest: false,
         }),
       );
+    }
+    if (this.world) {
+      const pass = this.getRenderer().postproduction.excludedObjectsPass;
+      if (pass !== this._pointsExclusionPass) {
+        this._pointsExclusionPass?.removeExcludedMaterial(this._mesh.material);
+        pass.addExcludedMaterial(this._mesh.material);
+        this._pointsExclusionPass = pass;
+      }
     }
     return this._mesh;
   }
@@ -139,6 +204,7 @@ export class Outliner extends OBC.Component implements OBC.Disposable {
   set color(value: THREE.Color) {
     const pass = this.getRenderer().postproduction.outlinePass;
     pass.outlineColor = value;
+    this.updateDefaultConfig({ color: value });
     this._points.material.color.copy(value);
   }
 
@@ -149,6 +215,7 @@ export class Outliner extends OBC.Component implements OBC.Disposable {
 
   set thickness(value: number) {
     this.getRenderer().postproduction.outlinePass.thickness = value;
+    this.updateDefaultConfig({ thickness: value });
   }
 
   /** Fill color for the default group. */
@@ -158,6 +225,7 @@ export class Outliner extends OBC.Component implements OBC.Disposable {
 
   set fillColor(value: THREE.Color) {
     this.getRenderer().postproduction.outlinePass.fillColor = value;
+    this.updateDefaultConfig({ fillColor: value });
   }
 
   /** Fill opacity for the default group. */
@@ -167,6 +235,7 @@ export class Outliner extends OBC.Component implements OBC.Disposable {
 
   set fillOpacity(value: number) {
     this.getRenderer().postproduction.outlinePass.fillOpacity = value;
+    this.updateDefaultConfig({ fillOpacity: value });
   }
 
   readonly onDisposed = new OBC.Event();
@@ -192,6 +261,7 @@ export class Outliner extends OBC.Component implements OBC.Disposable {
   private _backgroundErrors: unknown[] = [];
   private _updateRevisions = new Map<string, number>();
   private _modelEventsUnbind: (() => void) | null = null;
+  private _highlighterStylesUnbind: (() => void) | null = null;
 
   constructor(components: OBC.Components) {
     super(components);
@@ -213,23 +283,27 @@ export class Outliner extends OBC.Component implements OBC.Disposable {
    * @param config - Optional visual configuration.
    */
   create(name: string, config: OutlineGroupConfig = {}) {
+    const state = this.ensureGroup(name);
+    state.config = this.mergeGroupConfig(state.config, config);
     if (this.world) {
       this.getRenderer().postproduction.outlinePass.addGroup(
         name,
-        this.toPassConfig(config),
+        this.toPassConfig(state.config),
       );
     }
-    this.ensureGroup(name);
   }
 
   /**
    * Updates an existing group's visual configuration.
    */
   configure(name: string, config: OutlineGroupConfig) {
+    const state = this._groups.get(name);
+    if (!state) return;
+    state.config = this.mergeGroupConfig(state.config, config);
     if (!this.world) return;
     this.getRenderer().postproduction.outlinePass.configureGroup(
       name,
-      this.toPassConfig(config),
+      this.toPassConfig(state.config),
     );
   }
 
@@ -364,11 +438,16 @@ export class Outliner extends OBC.Component implements OBC.Disposable {
     }
     for (const [, listener] of this._tileListeners) listener.unbind();
     this._tileListeners.clear();
+    if (this._highlighterStylesUnbind) {
+      this._highlighterStylesUnbind();
+      this._highlighterStylesUnbind = null;
+    }
     for (const name of [...this._groups.keys()]) {
       if (name === DEFAULT_GROUP) continue;
       this.remove(name);
     }
     this.clean();
+    this.world = undefined;
     this.onDisposed.trigger(Outliner.uuid);
   }
 
@@ -386,11 +465,30 @@ export class Outliner extends OBC.Component implements OBC.Disposable {
     };
   }
 
+  private mergeGroupConfig(
+    current: OutlineGroupConfig,
+    update: OutlineGroupConfig,
+  ): OutlineGroupConfig {
+    return {
+      color: update.color?.clone() ?? current.color?.clone(),
+      fillColor: update.fillColor?.clone() ?? current.fillColor?.clone(),
+      fillOpacity: update.fillOpacity ?? current.fillOpacity,
+      thickness: update.thickness ?? current.thickness,
+      priority: update.priority ?? current.priority,
+    };
+  }
+
+  private updateDefaultConfig(config: OutlineGroupConfig) {
+    const state = this.ensureGroup(DEFAULT_GROUP);
+    state.config = this.mergeGroupConfig(state.config, config);
+  }
+
   private ensureGroup(name: string): OutlineGroupState {
     let state = this._groups.get(name);
     if (state) return state;
     state = {
       map: {},
+      config: {},
       attached: new Map(),
       activeStyles: new Set(),
       styleCallbacks: {},
@@ -415,11 +513,15 @@ export class Outliner extends OBC.Component implements OBC.Disposable {
       this.unwireStyle(style, DEFAULT_GROUP);
     });
 
-    highlighter.styles.onItemDeleted.add((style) => {
+    const onHighlighterStyleDeleted = (style: string) => {
       this.styles.delete(style);
       // Also tear down any named-group wirings for this style.
       for (const [name] of this._groups) this.unwireStyle(style, name);
-    });
+    };
+    highlighter.styles.onItemDeleted.add(onHighlighterStyleDeleted);
+    this._highlighterStylesUnbind = () => {
+      highlighter.styles.onItemDeleted.remove(onHighlighterStyleDeleted);
+    };
   }
 
   private wireStyle(style: string, groupName: string) {
@@ -499,21 +601,28 @@ export class Outliner extends OBC.Component implements OBC.Disposable {
     revision: number,
   ) {
     const state = this.ensureGroup(name);
-    if (!this.world) return;
-    const renderer = this.getRenderer();
+    const world = this.world;
+    if (!world) return;
+    const renderer = this.getRenderer(world);
     const pass = renderer.postproduction.outlinePass;
 
     // Make sure the pass knows about this group (palette + material +
     // container). The Outliner's ensureGroup only tracks selection state.
-    if (!pass.hasGroup(name)) pass.addGroup(name);
+    if (!pass.hasGroup(name)) {
+      pass.addGroup(name, this.toPassConfig(state.config));
+    }
 
+    const map = OBC.ModelIdMapUtils.clone(state.map);
     if (name === DEFAULT_GROUP && this.outlinePositions) {
-      await this.updatePoints();
-      if (!this.isGroupUpdateCurrent(name, state, revision)) return;
+      const fragments = this.components.get(OBC.FragmentsManager);
+      const positions = await fragments.getPositions(map);
+      if (!this.isGroupUpdateCurrent(name, state, revision, world, pass)) {
+        return;
+      }
+      this.updatePoints(positions);
     }
 
     const fragments = this.components.get(OBC.FragmentsManager);
-    const map = state.map;
 
     // Snapshot current attachments so we can diff after the queries.
     const previouslyAttached = new Map<string, Set<THREE.Mesh>>();
@@ -556,7 +665,7 @@ export class Outliner extends OBC.Component implements OBC.Disposable {
     }
 
     const results = await Promise.all(queries);
-    if (!this.isGroupUpdateCurrent(name, state, revision)) return;
+    if (!this.isGroupUpdateCurrent(name, state, revision, world, pass)) return;
 
     // Attach (or refresh) every tile that came back; track attachments
     // for next-time diffs.
@@ -594,10 +703,16 @@ export class Outliner extends OBC.Component implements OBC.Disposable {
     name: string,
     state: OutlineGroupState,
     revision: number,
+    world: OBC.World,
+    pass: PostproductionRenderer["postproduction"]["outlinePass"],
   ) {
     return (
       this._groups.get(name) === state &&
-      this._updateRevisions.get(name) === revision
+      this._updateRevisions.get(name) === revision &&
+      this.world === world &&
+      this._outlinePass === pass &&
+      !world.isDisposing &&
+      this.getRenderer(world).postproduction.outlinePass === pass
     );
   }
 
@@ -629,7 +744,19 @@ export class Outliner extends OBC.Component implements OBC.Disposable {
       state.attached = new Map();
       return;
     }
-    const pass = this.getRenderer().postproduction.outlinePass;
+    const pass = this._outlinePass;
+    if (!pass) {
+      state.attached = new Map();
+      return;
+    }
+    this.detachAllFromPass(state, group, pass);
+  }
+
+  private detachAllFromPass(
+    state: OutlineGroupState,
+    group: string,
+    pass: PostproductionRenderer["postproduction"]["outlinePass"],
+  ) {
     for (const [, tiles] of state.attached) {
       for (const tile of tiles) pass.detachOutlinedTile(tile, group);
     }
@@ -697,27 +824,22 @@ export class Outliner extends OBC.Component implements OBC.Disposable {
 
   private cleanPoints() {
     if (this._mesh) {
+      this._pointsExclusionPass?.removeExcludedMaterial(this._mesh.material);
+      this._pointsExclusionPass = null;
       const disposer = this.components.get(OBC.Disposer);
       disposer.destroy(this._mesh, true, true);
     }
     this._mesh = null;
   }
 
-  private async updatePoints() {
-    const defaultMap = this._groups.get(DEFAULT_GROUP)?.map ?? {};
-    let items = 0;
-
-    for (const [, localIds] of Object.entries(defaultMap)) {
-      items += localIds.size;
-    }
-
+  private updatePoints(positions: THREE.Vector3[]) {
     this._points.geometry.setAttribute(
       "position",
-      new THREE.Float32BufferAttribute(new Float32Array(items * 3), 3),
+      new THREE.Float32BufferAttribute(
+        new Float32Array(positions.length * 3),
+        3,
+      ),
     );
-
-    const fragments = this.components.get(OBC.FragmentsManager);
-    const positions = await fragments.getPositions(defaultMap);
 
     for (let i = 0; i < positions.length; i++) {
       const { x, y, z } = positions[i];
@@ -729,12 +851,12 @@ export class Outliner extends OBC.Component implements OBC.Disposable {
     this._points.geometry.attributes.position.needsUpdate = true;
   }
 
-  private getRenderer() {
-    if (!this.world) {
+  private getRenderer(world = this.world) {
+    if (!world) {
       throw new Error("You must set a world to use the outliner!");
     }
 
-    const renderer = this.world.renderer as PostproductionRenderer;
+    const renderer = world.renderer as PostproductionRenderer;
     if (!renderer.postproduction) {
       throw new Error(
         "The world given to the outliner must use the postproduction renderer.",
