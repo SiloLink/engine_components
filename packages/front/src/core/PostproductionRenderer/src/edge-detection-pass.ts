@@ -20,10 +20,8 @@ export enum EdgeDetectionPassMode {
 }
 
 export class EdgeDetectionPass extends Pass {
-  private _edgeMaterial: THREE.ShaderMaterial;
-  private _combineMaterial: THREE.ShaderMaterial;
+  private _edgeCompositeMaterial: THREE.ShaderMaterial;
   private _fsQuad: FullScreenQuad;
-  private _edgeRenderTarget: THREE.WebGLRenderTarget;
   private _vertexColorRenderTarget: THREE.WebGLRenderTarget;
   // @ts-ignore
   private _fragments: OBC.FragmentsManager;
@@ -48,23 +46,22 @@ export class EdgeDetectionPass extends Pass {
 
   set mode(value: EdgeDetectionPassMode) {
     this._mode = value;
-    this.setMaterialToMesh(false);
   }
 
   get width() {
-    return this._edgeMaterial.uniforms.width.value;
+    return this._edgeCompositeMaterial.uniforms.width.value;
   }
 
   set width(value: number) {
-    this._edgeMaterial.uniforms.width.value = value;
+    this._edgeCompositeMaterial.uniforms.width.value = value;
   }
 
   get color() {
-    return this._combineMaterial.uniforms.edgeColor.value;
+    return this._edgeCompositeMaterial.uniforms.edgeColor.value;
   }
 
   set color(value: THREE.Color) {
-    this._combineMaterial.uniforms.edgeColor.value = value;
+    this._edgeCompositeMaterial.uniforms.edgeColor.value = value;
   }
 
   get depthBiasStrength() {
@@ -155,43 +152,13 @@ export class EdgeDetectionPass extends Pass {
       `,
     });
 
-    this._edgeMaterial = new THREE.ShaderMaterial({
+    this._edgeCompositeMaterial = new THREE.ShaderMaterial({
+      depthTest: false,
+      depthWrite: false,
       uniforms: {
         tDiffuse: { value: null },
+        tEdgeData: { value: null },
         width: { value: width },
-      },
-      vertexShader: `
-        varying vec2 vUv;
-        void main() {
-          vUv = uv;
-          gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0);
-        }
-      `,
-      fragmentShader: `
-        uniform sampler2D tDiffuse;
-        uniform float width;
-        varying vec2 vUv;
-
-        void main() {
-          vec2 texel = vec2(1.0 / float(textureSize(tDiffuse, 0).x), 1.0 / float(textureSize(tDiffuse, 0).y));
-          vec2 offset = texel * width;
-          
-          vec4 center = texture2D(tDiffuse, vUv);
-          vec4 right = texture2D(tDiffuse, vUv + vec2(offset.x, 0.0));
-          vec4 up = texture2D(tDiffuse, vUv + vec2(0.0, offset.y));
-          
-          float diff = 0.0;
-          diff += distance(center.rgb, right.rgb);
-          diff += distance(center.rgb, up.rgb);
-          gl_FragColor = vec4(vec3(step(0.0001, diff)), 1.0);
-        }
-      `,
-    });
-
-    this._combineMaterial = new THREE.ShaderMaterial({
-      uniforms: {
-        tDiffuse: { value: null },
-        tEdges: { value: null },
         edgeColor: { value: new THREE.Color(0x888888) },
       },
       vertexShader: `
@@ -203,27 +170,30 @@ export class EdgeDetectionPass extends Pass {
       `,
       fragmentShader: `
         uniform sampler2D tDiffuse;
-        uniform sampler2D tEdges;
+        uniform sampler2D tEdgeData;
+        uniform float width;
         uniform vec3 edgeColor;
         varying vec2 vUv;
 
         void main() {
+          vec2 texel = vec2(1.0 / float(textureSize(tEdgeData, 0).x), 1.0 / float(textureSize(tEdgeData, 0).y));
+          vec2 offset = texel * width;
+
+          vec4 center = texture2D(tEdgeData, vUv);
+          vec4 right = texture2D(tEdgeData, vUv + vec2(offset.x, 0.0));
+          vec4 up = texture2D(tEdgeData, vUv + vec2(0.0, offset.y));
+
+          float diff = 0.0;
+          diff += distance(center.rgb, right.rgb);
+          diff += distance(center.rgb, up.rgb);
           vec4 color = texture2D(tDiffuse, vUv);
-          vec4 edges = texture2D(tEdges, vUv);
-          
-          // Combine color with edges (edges are black, so we multiply)
-          gl_FragColor = mix(color, vec4(edgeColor, 1.0), edges.r);
+          float edge = step(0.0001, diff);
+          gl_FragColor = mix(color, vec4(edgeColor, 1.0), edge);
         }
       `,
     });
 
-    this._fsQuad = new FullScreenQuad(this._edgeMaterial);
-
-    this._edgeRenderTarget = new THREE.WebGLRenderTarget(1, 1, {
-      minFilter: THREE.LinearFilter,
-      magFilter: THREE.LinearFilter,
-      format: THREE.RGBAFormat,
-    });
+    this._fsQuad = new FullScreenQuad(this._edgeCompositeMaterial);
 
     // When the renderer runs reversed-Z, give this pass a float32 depth
     // attachment so precision stays near-uniform across the range: the real
@@ -249,12 +219,11 @@ export class EdgeDetectionPass extends Pass {
   }
 
   setSize(width: number, height: number) {
-    this._edgeRenderTarget.setSize(width, height);
     this._vertexColorRenderTarget.setSize(width, height);
   }
 
   setWidth(width: number) {
-    this._edgeMaterial.uniforms.width.value = width;
+    this._edgeCompositeMaterial.uniforms.width.value = width;
   }
 
   render(
@@ -273,34 +242,41 @@ export class EdgeDetectionPass extends Pass {
     currentScene.fog = null;
     currentScene.background = null;
 
-    if (this._mode === EdgeDetectionPassMode.DEFAULT) {
-      this.setMaterialToMesh(true);
-      renderer.setRenderTarget(this._vertexColorRenderTarget);
-      renderer.render(scene, currentWorld!.camera.three);
-      this.setMaterialToMesh(false);
-    } else if (this._mode === EdgeDetectionPassMode.GLOBAL) {
-      const previousOverrideMaterial = scene.overrideMaterial;
-      scene.overrideMaterial = this._overrideMaterial;
-      renderer.setRenderTarget(this._vertexColorRenderTarget);
-      renderer.render(scene, currentWorld!.camera.three);
-      scene.overrideMaterial = previousOverrideMaterial;
+    try {
+      if (this._mode === EdgeDetectionPassMode.DEFAULT) {
+        const previousMaterials = new Map<
+          THREE.Mesh,
+          THREE.Material | THREE.Material[]
+        >();
+        try {
+          this.setMaterialToMesh(previousMaterials);
+          renderer.setRenderTarget(this._vertexColorRenderTarget);
+          renderer.render(scene, currentWorld!.camera.three);
+        } finally {
+          this.restoreMaterials(previousMaterials);
+        }
+      } else if (this._mode === EdgeDetectionPassMode.GLOBAL) {
+        const previousOverrideMaterial = scene.overrideMaterial;
+        scene.overrideMaterial = this._overrideMaterial;
+        try {
+          renderer.setRenderTarget(this._vertexColorRenderTarget);
+          renderer.render(scene, currentWorld!.camera.three);
+        } finally {
+          scene.overrideMaterial = previousOverrideMaterial;
+        }
+      }
+    } finally {
+      currentScene.fog = prevFog;
+      currentScene.background = prevBackground;
     }
 
-    currentScene.fog = prevFog;
-    currentScene.background = prevBackground;
-
-    // Render edges
-    this._edgeMaterial.uniforms.tDiffuse.value =
+    // Detect and composite edges in one fullscreen stage. The previous
+    // two-stage path wrote a binary edge mask to a full-size intermediate
+    // target only to sample it immediately in the combine shader.
+    this._edgeCompositeMaterial.uniforms.tDiffuse.value = readBuffer.texture;
+    this._edgeCompositeMaterial.uniforms.tEdgeData.value =
       this._vertexColorRenderTarget.texture;
-    this._fsQuad.material = this._edgeMaterial;
-    renderer.setRenderTarget(this._edgeRenderTarget);
-    this._fsQuad.render(renderer);
-
-    // Combine color and edges
-    this._combineMaterial.uniforms.tDiffuse.value = readBuffer.texture;
-    this._combineMaterial.uniforms.tEdges.value =
-      this._edgeRenderTarget.texture;
-    this._fsQuad.material = this._combineMaterial;
+    this._fsQuad.material = this._edgeCompositeMaterial;
 
     if (this.renderToScreen) {
       renderer.setRenderTarget(null);
@@ -312,61 +288,64 @@ export class EdgeDetectionPass extends Pass {
   }
 
   dispose() {
-    this._edgeMaterial.dispose();
-    this._combineMaterial.dispose();
+    this._edgeCompositeMaterial.dispose();
     this._overrideMaterial.dispose();
     this._fsQuad.dispose();
-    this._edgeRenderTarget.dispose();
     this._vertexColorRenderTarget.dispose();
   }
 
-  private setMaterialToMesh(apply: boolean) {
+  private setMaterialToMesh(
+    previousMaterials: Map<THREE.Mesh, THREE.Material | THREE.Material[]>,
+  ) {
     if (!this._fragments.initialized) return;
+    const overrideArrays = new Map<number, THREE.Material[]>();
     for (const [, model] of this._fragments.core.models.list) {
       for (const [, mesh] of model.tiles) {
         if ("isLODGeometry" in mesh.geometry) {
           continue;
         }
 
-        if (apply) {
-          mesh.userData.edgePassPreviousMaterial = mesh.material;
-          // Fragments meshes are batched: each mesh has a material array
-          // indexed by group `materialIndex`. Highlighted samples live in
-          // groups whose materialIndex > 0 (pointing to the highlight
-          // material slot). Replacing `mesh.material` with a length-1 array
-          // leaves those groups resolving to `undefined`, so Three.js
-          // silently skips them and they produce no edges — which is the
-          // root of issue #707 (highlighted items look see-through under
-          // outline styles).
-          //
-          // Mirror the original material array length so every group maps
-          // to the override material. The override array is cached on the
-          // mesh and only rebuilt when the source array length changes
-          // (e.g. when the highlight system adds or removes a material
-          // slot), so we don't pay an allocation per mesh per frame. For
-          // non-array materials (xray, or non-fragments meshes), keep the
-          // single-material path which bypasses groups entirely.
-          const prev = mesh.material;
-          if (this.xray) {
-            mesh.material = this._overrideMaterial;
-          } else if (Array.isArray(prev)) {
-            let overrideArr = mesh.userData.edgePassOverrideArray as
-              | THREE.Material[]
-              | undefined;
-            if (!overrideArr || overrideArr.length !== prev.length) {
-              overrideArr = new Array<THREE.Material>(prev.length).fill(
-                this._overrideMaterial,
-              );
-              mesh.userData.edgePassOverrideArray = overrideArr;
-            }
-            mesh.material = overrideArr;
-          } else {
-            mesh.material = [this._overrideMaterial];
+        const previousMaterial = mesh.material;
+        previousMaterials.set(mesh, previousMaterial);
+        // Fragments meshes are batched: each mesh has a material array
+        // indexed by group `materialIndex`. Highlighted samples live in
+        // groups whose materialIndex > 0 (pointing to the highlight
+        // material slot). Replacing `mesh.material` with a length-1 array
+        // leaves those groups resolving to `undefined`, so Three.js
+        // silently skips them and they produce no edges — which is the
+        // root of issue #707 (highlighted items look see-through under
+        // outline styles).
+        //
+        // Mirror the original material array length so every group maps
+        // to the override material. Arrays of the same length can be shared
+        // during this render, avoiding per-mesh allocations without leaving
+        // restoration state on the mesh after the pass completes.
+        if (this.xray) {
+          mesh.material = this._overrideMaterial;
+        } else if (Array.isArray(previousMaterial)) {
+          let overrideArray = overrideArrays.get(previousMaterial.length);
+          if (!overrideArray) {
+            overrideArray = new Array<THREE.Material>(
+              previousMaterial.length,
+            ).fill(this._overrideMaterial);
+            overrideArrays.set(previousMaterial.length, overrideArray);
           }
-        } else if ("edgePassPreviousMaterial" in mesh.userData) {
-          mesh.material = mesh.userData.edgePassPreviousMaterial;
+          mesh.material = overrideArray;
+        } else {
+          mesh.material = [this._overrideMaterial];
         }
       }
     }
+  }
+
+  private restoreMaterials(
+    previousMaterials: Map<THREE.Mesh, THREE.Material | THREE.Material[]>,
+  ) {
+    for (const [mesh, material] of previousMaterials) {
+      mesh.material = material;
+      delete mesh.userData.edgePassPreviousMaterial;
+      delete mesh.userData.edgePassOverrideArray;
+    }
+    previousMaterials.clear();
   }
 }
