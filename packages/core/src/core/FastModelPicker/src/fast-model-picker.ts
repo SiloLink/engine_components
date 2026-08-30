@@ -14,19 +14,20 @@ import { FragmentsManager } from "../../../fragments";
  *
  * The fragments tile geometry already carries a per-vertex `id`
  * attribute (the internal item id). We render the BIM scene to an
- * offscreen target with a shader that packs `(modelByte, itemId)` into
- * RGBA, then `readPixels` at the cursor and decode. One render plus
- * one 4-byte readback per call. The model and item identities resolve
+ * integer offscreen target with a shader that writes `(modelIndex, itemId)`
+ * as two full-width uint32 channels, then `readPixels` at the cursor and
+ * decodes them. One render plus one 16-byte readback per call. The model and
+ * item identities resolve
  * on the main thread through the dense map installed with each model.
  *
- * Encoding (one pixel):
- *   R = modelByte (1..254, 0 = void / unwritten)
- *   G = (itemId >> 16) & 0xff
- *   B = (itemId >> 8)  & 0xff
- *   A = (itemId)       & 0xff
+ * Encoding (one RGBA32UI pixel):
+ *   R = modelIndex (1..2^32-1, 0 = void / unwritten)
+ *   G = itemId + 1 (0 = void / unwritten)
+ *   B = 0
+ *   A = 1
  *
- * `modelByte` is assigned per-pick from a `byteToModelId` map; the
- * picker re-allocates bytes each call so the assignment is stable for
+ * `modelIndex` is assigned per-pick from an `indexToModelId` map; the
+ * picker re-allocates indices each call so the assignment is stable for
  * the duration of the pick but doesn't grow over the session.
  */
 export class FastModelPicker implements Disposable {
@@ -48,19 +49,20 @@ export class FastModelPicker implements Disposable {
   /**
    * When `true`, mirrors the id render to a debug canvas pinned in the
    * top-right corner. Each model shows up as a near-uniform red band
-   * (the model byte) modulated by varying greens / blues from the
-   * per-item id encoding.
+   * (the low byte of the model index) modulated by the item-id bytes.
    */
   debugMode = false;
 
   /**
-   * Maximum models the picker can disambiguate in a single pick. Capped
-   * by the 8-bit `modelByte`. In practice we never approach this.
+   * Maximum models the picker can disambiguate in a single pick. Zero is
+   * reserved as the void sentinel, leaving the rest of the uint32 range.
    */
-  static readonly MAX_MODELS = 254;
+  static readonly MAX_MODELS = 0xffffffff;
   static readonly PICK_SIZE = 4;
 
   private _renderTarget?: THREE.WebGLRenderTarget;
+  /** Full-width model/item identity target, separate from RGBA8 depth data. */
+  private _identityRenderTarget?: THREE.WebGLRenderTarget;
   private _renderTargetSize = new THREE.Vector2();
   /** Detached camera whose projection is cropped to the cursor pixels. */
   private _pickCamera?: THREE.Camera;
@@ -72,7 +74,7 @@ export class FastModelPicker implements Disposable {
 
   /** Base shader used to create model-specific id materials. */
   private _idMaterial: THREE.ShaderMaterial;
-  /** Reusable model-byte materials that share one shader program. */
+  /** Reusable model-index materials that share one shader program. */
   private _idMaterials: THREE.ShaderMaterial[] = [];
 
   /**
@@ -124,6 +126,13 @@ export class FastModelPicker implements Disposable {
   };
   private _pickTileCount = 0;
   private _pickVisibleTileCount = 0;
+
+  /** Model roots that received a valid index for the current identity pass. */
+  private _identityModelRoots = new Set<THREE.Object3D>();
+
+  /** Exact renderer event subscription owned by this picker. */
+  private _resizeEvent?: Event<THREE.Vector2>;
+  private _resizeHandler?: (newSize: THREE.Vector2) => void;
 
   /**
    * LOD line meshes don't carry the per-vertex `id` attribute and would
@@ -322,6 +331,11 @@ export class FastModelPicker implements Disposable {
 
   /** {@link Disposable.dispose} */
   dispose() {
+    if (this._resizeEvent && this._resizeHandler) {
+      this._resizeEvent.remove(this._resizeHandler);
+    }
+    this._resizeEvent = undefined;
+    this._resizeHandler = undefined;
     this.mouse.dispose();
     this.removeDebugCanvas();
     for (const material of this._idMaterials) material.dispose();
@@ -331,10 +345,13 @@ export class FastModelPicker implements Disposable {
     this._normalMaterial.dispose();
     if (this._renderTarget) this._renderTarget.dispose();
     this._renderTarget = undefined;
+    if (this._identityRenderTarget) this._identityRenderTarget.dispose();
+    this._identityRenderTarget = undefined;
     this._originalMaterials.clear();
     this._materialArrays.clear();
     this._lastIdentityPickStats = undefined;
     this._hiddenLods.length = 0;
+    this._identityModelRoots.clear();
     this.onDisposed.trigger();
     this.onDisposed.reset();
   }
@@ -345,22 +362,22 @@ export class FastModelPicker implements Disposable {
 
   /**
    * Runs one id render and returns the raw decoded `(modelId, itemId)`
-   * for the cursor pixel. Model and item identity share one RGBA8 pixel.
+   * for the cursor pixel. Model and item identity share one RGBA32UI pixel.
    */
   private async runIdPass(
     position?: THREE.Vector2,
   ): Promise<{ modelId: string; itemId: number } | null> {
     if (!this.enabled) return null;
-    if (!this._renderTarget) return null;
+    if (!this._identityRenderTarget) return null;
     if (!this.world.renderer) return null;
 
     const fragments = this.components.get(FragmentsManager);
     if (!fragments.initialized || fragments.list.size === 0) return null;
 
     const prepareStartedAt = performance.now();
-    const byteToModel = this.applyIdMaterial();
+    const indexToModel = this.applyIdMaterial();
     const prepareMs = performance.now() - prepareStartedAt;
-    if (byteToModel.size === 0) {
+    if (indexToModel.size === 0) {
       const restoreStartedAt = performance.now();
       this.restoreOriginalMaterials();
       this._lastIdentityPickStats = {
@@ -397,7 +414,11 @@ export class FastModelPicker implements Disposable {
 
     const readbackStartedAt = performance.now();
     if (this.debugMode && this._debugCanvas) this.updateDebugCanvas();
-    const pixel = this.readPixelAt(this._renderTarget, view.readX, view.readY);
+    const pixel = this.readIdentityPixelAt(
+      this._identityRenderTarget,
+      view.readX,
+      view.readY,
+    );
     this._lastIdentityPickStats = {
       prepareMs,
       renderMs,
@@ -410,17 +431,14 @@ export class FastModelPicker implements Disposable {
     };
     if (!pixel) return null;
 
-    const modelByte = pixel[0];
-    if (modelByte === 0) return null; // void
-    const modelId = byteToModel.get(modelByte);
+    const modelIndex = pixel[0];
+    if (modelIndex === 0) return null; // void
+    const modelId = indexToModel.get(modelIndex);
     if (!modelId) return null;
 
-    // The worker writes `itemId + 1` (big-endian, 4 bytes), capped
-    // at 24 bits in practice — itemId is bounded by item count per
-    // model. The shader output drops the high byte and keeps the
-    // lower three (G, B, A). Decoded 0 = "no item under cursor".
-    // eslint-disable-next-line no-bitwise
-    const encoded = (pixel[1] << 16) | (pixel[2] << 8) | pixel[3];
+    // The worker writes `itemId + 1` as four big-endian bytes. The shader
+    // reconstructs the complete uint32 into G, so no identity bits are lost.
+    const encoded = pixel[1];
     if (encoded === 0) return null;
     const itemId = encoded - 1;
     return { modelId, itemId };
@@ -431,20 +449,21 @@ export class FastModelPicker implements Disposable {
    * per-vertex `id` attribute, stashes the original material and swaps
    * in the shared id-encoding shader. Hides LOD line meshes (which
    * lack `id`) so they don't pollute the id buffer. Returns the
-   * temporary `byte → modelId` map the render pass uses to
+   * temporary `modelIndex → modelId` map the render pass uses to
    * disambiguate models.
    */
   private applyIdMaterial(): Map<number, string> {
     const fragments = this.components.get(FragmentsManager);
-    const byteToModel = new Map<number, string>();
+    const indexToModel = new Map<number, string>();
+    this._identityModelRoots.clear();
     this._pickTileCount = 0;
     this._pickVisibleTileCount = 0;
     const planes = this.world.renderer!.three.clippingPlanes ?? [];
-    let nextByte = 1;
+    let nextModelIndex = 1;
 
     for (const [modelId, model] of fragments.list) {
-      if (nextByte > FastModelPicker.MAX_MODELS) break;
-      const idMaterial = this.getIdMaterial(nextByte);
+      if (nextModelIndex > FastModelPicker.MAX_MODELS) break;
+      const idMaterial = this.getIdMaterial(nextModelIndex);
       idMaterial.clippingPlanes = planes;
       idMaterial.clipping = planes.length > 0;
       let hasOwnedMesh = false;
@@ -470,21 +489,26 @@ export class FastModelPicker implements Disposable {
       }
 
       if (!hasOwnedMesh) continue;
-      byteToModel.set(nextByte, modelId);
-      nextByte += 1;
+      indexToModel.set(nextModelIndex, modelId);
+      this._identityModelRoots.add(model.object);
+      nextModelIndex += 1;
     }
 
-    return byteToModel;
+    return indexToModel;
   }
 
   /**
    * Renders all visible BIM models in one id pass. Each model's meshes use
    * a model-specific material, so normal depth testing resolves the
-   * front-most `(modelByte, itemId)` in a single scene render.
+   * front-most `(modelIndex, itemId)` in a single scene render.
    */
   private renderIdPass(ndc: THREE.Vector2) {
     const view = this.createPickView(ndc);
-    this.renderPickPass(this._renderTarget!, view.camera);
+    this.renderPickPass(
+      this._identityRenderTarget!,
+      view.camera,
+      this._identityModelRoots,
+    );
     return view;
   }
 
@@ -522,6 +546,13 @@ export class FastModelPicker implements Disposable {
       this._renderTarget!.height !== height
     ) {
       this._renderTarget!.setSize(width, height);
+    }
+    if (
+      this._identityRenderTarget &&
+      (this._identityRenderTarget.width !== width ||
+        this._identityRenderTarget.height !== height)
+    ) {
+      this._identityRenderTarget.setSize(width, height);
     }
     const sourceX = Math.max(
       0,
@@ -580,6 +611,7 @@ export class FastModelPicker implements Disposable {
   private renderPickPass(
     target: THREE.WebGLRenderTarget,
     camera: THREE.Camera,
+    includedModelRoots?: ReadonlySet<THREE.Object3D>,
   ) {
     const renderer = this.world.renderer!.three;
     const scene = this.world.scene.three;
@@ -592,7 +624,11 @@ export class FastModelPicker implements Disposable {
     const prevScissor = renderer.getScissor(new THREE.Vector4());
 
     const prevBackground = (scene as THREE.Scene).background;
-    const nonBimVisibility = this.hideNonBimMeshes(scene, fragments);
+    const nonBimVisibility = this.hideNonBimMeshes(
+      scene,
+      fragments,
+      includedModelRoots,
+    );
     try {
       (scene as THREE.Scene).background = null;
       renderer.setRenderTarget(target);
@@ -735,16 +771,17 @@ export class FastModelPicker implements Disposable {
 
     for (const obj of this._hiddenLods) obj.visible = true;
     this._hiddenLods.length = 0;
+    this._identityModelRoots.clear();
   }
 
-  private getIdMaterial(modelByte: number) {
-    const index = modelByte - 1;
+  private getIdMaterial(modelIndex: number) {
+    const index = modelIndex - 1;
     let material = this._idMaterials[index];
     if (!material) {
       material = index === 0 ? this._idMaterial : this._idMaterial.clone();
       this._idMaterials[index] = material;
     }
-    material.uniforms.modelByte.value = modelByte;
+    material.uniforms.modelIndex.value = modelIndex;
     return material;
   }
 
@@ -762,10 +799,21 @@ export class FastModelPicker implements Disposable {
     return materials;
   }
 
-  private hideNonBimMeshes(scene: THREE.Object3D, fragments: FragmentsManager) {
+  private hideNonBimMeshes(
+    scene: THREE.Object3D,
+    fragments: FragmentsManager,
+    includedModelRoots?: ReadonlySet<THREE.Object3D>,
+  ) {
     const modelRoots = new Set<THREE.Object3D>();
     for (const [, model] of fragments.list) modelRoots.add(model.object);
     const visibility = new Map<THREE.Object3D, boolean>();
+    if (includedModelRoots) {
+      for (const root of modelRoots) {
+        if (includedModelRoots.has(root)) continue;
+        visibility.set(root, root.visible);
+        root.visible = false;
+      }
+    }
     const stack: THREE.Object3D[] = [scene];
     while (stack.length) {
       const node = stack.pop()!;
@@ -792,6 +840,19 @@ export class FastModelPicker implements Disposable {
     return pixels;
   }
 
+  private readIdentityPixelAt(
+    target: THREE.WebGLRenderTarget,
+    x: number,
+    y: number,
+  ): Uint32Array | null {
+    const renderer = this.world.renderer!.three;
+    const cx = Math.max(0, Math.min(target.width - 1, Math.floor(x)));
+    const cy = Math.max(0, Math.min(target.height - 1, Math.floor(y)));
+    const pixels = new Uint32Array(4);
+    renderer.readRenderTargetPixels(target, cx, cy, 1, 1, pixels);
+    return pixels;
+  }
+
   // ---------------------------------------------------------------------------
   // Setup / teardown
   // ---------------------------------------------------------------------------
@@ -801,30 +862,32 @@ export class FastModelPicker implements Disposable {
    *   - `id`: per-vertex `vec4` — the four bytes of `itemId + 1`
    *     (big-endian) supplied as a non-normalised `Uint8Array`
    *     attribute by fragments. Each component is 0–255 as a float.
-   *   - `modelByte` uniform — the byte assigned to the currently-
+   *   - `modelIndex` uniform — the uint32 index assigned to the currently-
    *     rendered model.
    *
-   * Output packs `(modelByte, idMid, idLo1, idLo0)` into one RGBA8
-   * pixel: model byte in R, the lower three bytes of `itemId + 1` in
-   * GBA. Capping the encoded id at 24 bits is fine because `itemId`
-   * is the FlatBuffer item index — bounded by item count per model
-   * (16M is plenty for any practical BIM model). The high byte of
-   * the vertex attribute (`vId.x`) is therefore always 0 and we
-   * discard it; that frees R for the model byte. One render → one
-   * readback per pick (the previous two-target layout cost two
-   * sync-stalling readPixels calls).
+   * Output writes `(modelIndex, itemId + 1, 0, 1)` into one RGBA32UI
+   * pixel. Reconstructing all four id bytes preserves the Fragments uint32
+   * identity contract while retaining one render and one synchronous readback.
    */
   private buildIdMaterial(): THREE.ShaderMaterial {
     return new THREE.ShaderMaterial({
-      uniforms: { modelByte: { value: 1 } },
+      glslVersion: THREE.GLSL3,
+      uniforms: { modelIndex: { value: 1 } },
       vertexShader: `
-        attribute vec4 id;
-        varying vec4 vId;
+        in vec4 id;
+        uniform uint modelIndex;
+        flat out uvec4 vIdentity;
         #if NUM_CLIPPING_PLANES > 0
-          varying vec3 vClipPosition;
+          out vec3 vClipPosition;
         #endif
         void main() {
-          vId = id;
+          uvec4 idBytes = uvec4(id);
+          uint encodedItemId =
+            (idBytes.x << 24u) |
+            (idBytes.y << 16u) |
+            (idBytes.z << 8u) |
+            idBytes.w;
+          vIdentity = uvec4(modelIndex, encodedItemId, 0u, 1u);
           vec4 mvPosition = modelViewMatrix * vec4(position, 1.0);
           #if NUM_CLIPPING_PLANES > 0
             vClipPosition = -mvPosition.xyz;
@@ -834,10 +897,11 @@ export class FastModelPicker implements Disposable {
       `,
       fragmentShader: `
         precision highp float;
-        uniform float modelByte;
-        varying vec4 vId;
+        precision highp int;
+        flat in uvec4 vIdentity;
+        layout(location = 0) out uvec4 outIdentity;
         #if NUM_CLIPPING_PLANES > 0
-          varying vec3 vClipPosition;
+          in vec3 vClipPosition;
           uniform vec4 clippingPlanes[NUM_CLIPPING_PLANES];
         #endif
         void main() {
@@ -847,10 +911,11 @@ export class FastModelPicker implements Disposable {
               if (dot(vClipPosition, plane.xyz) > plane.w) discard;
             }
           #endif
-          gl_FragColor = vec4(modelByte / 255.0, vId.y / 255.0, vId.z / 255.0, vId.w / 255.0);
+          outIdentity = vIdentity;
         }
       `,
       side: THREE.DoubleSide,
+      toneMapped: false,
     });
   }
 
@@ -966,7 +1031,8 @@ export class FastModelPicker implements Disposable {
   }
 
   private setupRenderTarget() {
-    const renderer = this.world.renderer!.three;
+    const worldRenderer = this.world.renderer!;
+    const renderer = worldRenderer.three;
     const size = renderer.getSize(new THREE.Vector2());
     this._renderTargetSize.copy(size);
     const width = Math.min(
@@ -986,11 +1052,24 @@ export class FastModelPicker implements Disposable {
       depthBuffer: true,
     };
     this._renderTarget = new THREE.WebGLRenderTarget(width, height, opts);
+    this._identityRenderTarget = new THREE.WebGLRenderTarget(width, height, {
+      format: THREE.RGBAIntegerFormat,
+      type: THREE.UnsignedIntType,
+      minFilter: THREE.NearestFilter,
+      magFilter: THREE.NearestFilter,
+      depthBuffer: true,
+    });
 
     if (this.debugMode) this.setupDebugCanvas();
 
-    this.world.renderer!.onResize.add((newSize) => {
+    if (this._resizeEvent && this._resizeHandler) {
+      this._resizeEvent.remove(this._resizeHandler);
+    }
+    this._resizeHandler = (newSize) => {
       this._renderTargetSize.copy(newSize);
+      const renderTarget = this._renderTarget;
+      const identityRenderTarget = this._identityRenderTarget;
+      if (!renderTarget || !identityRenderTarget) return;
       const nextWidth = Math.min(
         FastModelPicker.PICK_SIZE,
         Math.max(1, Math.floor(newSize.x)),
@@ -999,18 +1078,23 @@ export class FastModelPicker implements Disposable {
         FastModelPicker.PICK_SIZE,
         Math.max(1, Math.floor(newSize.y)),
       );
-      this._renderTarget!.setSize(nextWidth, nextHeight);
+      renderTarget.setSize(nextWidth, nextHeight);
+      identityRenderTarget.setSize(nextWidth, nextHeight);
       if (this._debugCanvas) {
         this._debugCanvas.width = nextWidth;
         this._debugCanvas.height = nextHeight;
       }
-    });
+    };
+    this._resizeEvent = worldRenderer.onResize;
+    this._resizeEvent.add(this._resizeHandler);
   }
 
   private setupDebugCanvas() {
     if (this._debugCanvas) return;
-    const width = this._renderTarget?.width ?? FastModelPicker.PICK_SIZE;
-    const height = this._renderTarget?.height ?? FastModelPicker.PICK_SIZE;
+    const width =
+      this._identityRenderTarget?.width ?? FastModelPicker.PICK_SIZE;
+    const height =
+      this._identityRenderTarget?.height ?? FastModelPicker.PICK_SIZE;
 
     this._debugContainer = document.createElement("div");
     this._debugContainer.style.position = "fixed";
@@ -1042,16 +1126,20 @@ export class FastModelPicker implements Disposable {
   }
 
   private updateDebugCanvas() {
-    if (!this._debugCanvas || !this._renderTarget || !this.world.renderer) {
+    if (
+      !this._debugCanvas ||
+      !this._identityRenderTarget ||
+      !this.world.renderer
+    ) {
       return;
     }
     const renderer = this.world.renderer.three;
-    const width = this._renderTarget.width;
-    const height = this._renderTarget.height;
+    const width = this._identityRenderTarget.width;
+    const height = this._identityRenderTarget.height;
 
-    const pixels = new Uint8Array(width * height * 4);
+    const pixels = new Uint32Array(width * height * 4);
     renderer.readRenderTargetPixels(
-      this._renderTarget,
+      this._identityRenderTarget,
       0,
       0,
       width,
@@ -1069,10 +1157,20 @@ export class FastModelPicker implements Disposable {
       const dstRow = height - 1 - y;
       const srcOffset = srcRow * rowSize;
       const dstOffset = dstRow * rowSize;
-      imageData.data.set(
-        pixels.subarray(srcOffset, srcOffset + rowSize),
-        dstOffset,
-      );
+      for (let x = 0; x < width; x++) {
+        const src = srcOffset + x * 4;
+        const dst = dstOffset + x * 4;
+        const modelIndex = pixels[src];
+        const itemId = pixels[src + 1];
+        // Debug-only byte visualization of the two uint32 identity channels.
+        // eslint-disable-next-line no-bitwise
+        imageData.data[dst] = modelIndex & 0xff;
+        // eslint-disable-next-line no-bitwise
+        imageData.data[dst + 1] = (itemId >> 16) & 0xff;
+        // eslint-disable-next-line no-bitwise
+        imageData.data[dst + 2] = itemId & 0xff;
+        imageData.data[dst + 3] = modelIndex === 0 ? 0 : 255;
+      }
     }
     ctx.putImageData(imageData, 0, 0);
   }
