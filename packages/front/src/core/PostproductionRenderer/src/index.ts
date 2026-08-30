@@ -2,15 +2,16 @@ import * as THREE from "three";
 import * as OBC from "@thatopen/components";
 import { EffectComposer } from "three/examples/jsm/postprocessing/EffectComposer.js";
 import { GTAOPass } from "three/examples/jsm/postprocessing/GTAOPass.js";
-import { AOPass } from "./ao-pass";
 import { OutputPass } from "three/examples/jsm/postprocessing/OutputPass.js";
 import { SMAAPass } from "three/examples/jsm/postprocessing/SMAAPass.js";
+import { AOPass } from "./ao-pass";
 import { EdgeDetectionPass } from "./edge-detection-pass";
 import { SimpleOutlinePass } from "./simple-outline-pass";
 import { ExcludedObjectsPass } from "./excluded-objects-pass";
 import { PostproductionRenderer } from "..";
 import { BasePass } from "./base-pass";
 import { GlossPass } from "./gloss-pass";
+import { SceneDepthPass } from "./scene-depth-pass";
 
 // Export the GlossPass for external use
 export { GlossPass };
@@ -36,6 +37,7 @@ export class Postproduction {
   private _initialized = false;
 
   private _basePass?: BasePass;
+  private _sceneDepthPass?: SceneDepthPass;
   private _aoPass?: AOPass;
   private _outputPass?: OutputPass;
   private _edgeDetectionPass?: EdgeDetectionPass;
@@ -175,6 +177,7 @@ export class Postproduction {
     if (
       !this.composer ||
       !this._basePass ||
+      !this._sceneDepthPass ||
       !this._smaaPass ||
       !this._outputPass ||
       !this._aoPass ||
@@ -211,6 +214,9 @@ export class Postproduction {
     }
 
     if (value === PostproductionAspect.PEN) {
+      if (this._outlinesEnabled) {
+        this.composer.addPass(this._sceneDepthPass);
+      }
       this.composer.addPass(this._edgeDetectionPass);
       if (this._outlinesEnabled) {
         this.composer.addPass(this._simpleOutlinePass);
@@ -337,6 +343,7 @@ export class Postproduction {
     this._simpleOutlinePass?.dispose();
     this._excludedObjectsPass?.dispose();
     this._glossPass?.dispose();
+    this._sceneDepthPass?.dispose();
   }
 
   setSize(width: number, height: number) {
@@ -364,6 +371,12 @@ export class Postproduction {
     }
     if (this._aoPass) {
       this._aoPass.camera = camera;
+    }
+    if (this._sceneDepthPass) {
+      this._sceneDepthPass.camera = camera;
+    }
+    if (this._glossPass) {
+      this._glossPass.renderCamera = camera;
     }
   }
 
@@ -405,6 +418,11 @@ export class Postproduction {
       this.captureSceneDepth,
     );
     this._basePass = basePass;
+    this._sceneDepthPass = new SceneDepthPass(
+      scene,
+      camera,
+      this.captureSceneDepth,
+    );
 
     this._smaaPass = new SMAAPass();
 
@@ -417,7 +435,6 @@ export class Postproduction {
       this._renderer.three.domElement.width,
       this._renderer.three.domElement.height,
     );
-    this._aoPass.setSceneDepthObserver(this.captureSceneDepth);
     this._aoPass.output = GTAOPass.OUTPUT.Default;
     this._edgeDetectionPass = new EdgeDetectionPass(
       this._renderer,
@@ -446,7 +463,6 @@ export class Postproduction {
       ),
       this._renderer.currentWorld!,
     );
-    this._glossPass.setSceneDepthObserver(this.captureSceneDepth);
 
     this.style = PostproductionAspect.COLOR;
   }

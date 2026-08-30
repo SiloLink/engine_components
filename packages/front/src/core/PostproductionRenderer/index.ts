@@ -25,9 +25,12 @@ export class PostproductionRenderer extends RendererWith2D {
   manualModeDelay = 50;
 
   private _postproduction?: Postproduction;
-  private _timeout: any;
+  private _timeout?: ReturnType<typeof setTimeout>;
   private _previousStyle: PostproductionAspect = PostproductionAspect.COLOR;
   private _previousEnabled: boolean = false;
+  private _manualModePostproduction?: Postproduction;
+  private _manualModeEnabledOverridden = false;
+  private _manualModeStyleOverridden = false;
   /**
    * Getter for the postproduction instance.
    * Throws an error if the postproduction instance is not yet initialized.
@@ -52,26 +55,36 @@ export class PostproductionRenderer extends RendererWith2D {
       this.setPostproductionSize(size);
     });
 
-    this.onWorldChanged.add(() => {
-      if (this.currentWorld) {
-        if (this._postproduction) {
-          this._postproduction.dispose();
-        }
-        this._postproduction = new Postproduction(components, this);
-
-        this._postproduction.onStyleChanged.add(
-          (style: PostproductionAspect) => {
-            this._previousStyle = style;
-          },
-        );
-
-        this.setPostproductionSize();
+    this.onWorldChanged.add(({ world, action }) => {
+      if (action === "removed") {
+        if (this.currentWorld !== world) return;
+        this.discardManualModeUpdate();
+        this._postproduction?.dispose();
+        this._postproduction = undefined;
+        this.currentWorld = null;
+        return;
       }
+
+      this.discardManualModeUpdate();
+      this._postproduction?.dispose();
+      this._postproduction = new Postproduction(components, this);
+
+      this._postproduction.onStyleChanged.add((style: PostproductionAspect) => {
+        this._previousStyle = style;
+      });
+
+      this.setPostproductionSize();
     });
   }
 
   /** {@link Updateable.update} */
   update() {
+    const isManualMode = this.mode === OBC.RendererMode.MANUAL;
+    if (!isManualMode) {
+      this.cancelManualModeTimer();
+      this.restoreManualModeState();
+    }
+
     if (!this.enabled) return;
     if (!this.currentWorld) {
       return;
@@ -86,16 +99,8 @@ export class PostproductionRenderer extends RendererWith2D {
     const scene = this.currentWorld.scene.three;
     const camera = this.currentWorld.camera.three;
 
-    const isManualMode = this.mode === OBC.RendererMode.MANUAL;
     if (isManualMode) {
-      if (this.turnOffOnManualMode && this.postproduction.enabled) {
-        this._previousEnabled = this.postproduction.enabled;
-        this.postproduction.enabled = false;
-      }
-
-      if (this.manualDefaultStyle !== this.postproduction.style) {
-        this.setStyleWithoutEvent(this.manualDefaultStyle);
-      }
+      this.applyManualModeState(this.postproduction);
     }
 
     if (this.postproduction.enabled) {
@@ -105,19 +110,25 @@ export class PostproductionRenderer extends RendererWith2D {
     }
     if (this.mode === OBC.RendererMode.MANUAL) {
       // Use postproduction only on last frame
-      if (this._timeout) {
-        clearTimeout(this._timeout);
-      }
+      this.cancelManualModeTimer();
 
+      const scheduledPostproduction = this.postproduction;
       this._timeout = setTimeout(() => {
-        if (this.turnOffOnManualMode) {
-          this.postproduction.enabled = this._previousEnabled;
+        this._timeout = undefined;
+        if (
+          this._postproduction !== scheduledPostproduction ||
+          this._manualModePostproduction !== scheduledPostproduction
+        ) {
+          if (this._manualModePostproduction === scheduledPostproduction) {
+            this.resetManualModeState();
+          }
+          return;
         }
 
-        this.setStyleWithoutEvent(this._previousStyle);
+        this.restoreManualModeState(scheduledPostproduction);
 
-        if (this.postproduction.enabled) {
-          this.postproduction.update();
+        if (this.enabled && scheduledPostproduction.enabled) {
+          scheduledPostproduction.update();
         }
       }, this.manualModeDelay);
     }
@@ -127,15 +138,83 @@ export class PostproductionRenderer extends RendererWith2D {
 
   /** {@link OBC.Disposable.dispose}. */
   dispose() {
+    this.discardManualModeUpdate();
+    this._postproduction?.dispose();
+    this._postproduction = undefined;
     super.dispose();
-    this.postproduction.dispose();
   }
 
   // used to set the style without setting the _previousStyle
-  private setStyleWithoutEvent(style: PostproductionAspect) {
-    this.postproduction.onStyleChanged.enabled = false;
-    this.postproduction.style = style;
-    this.postproduction.onStyleChanged.enabled = true;
+  private setStyleWithoutEvent(
+    style: PostproductionAspect,
+    postproduction = this.postproduction,
+  ) {
+    postproduction.onStyleChanged.enabled = false;
+    try {
+      postproduction.style = style;
+    } finally {
+      postproduction.onStyleChanged.enabled = true;
+    }
+  }
+
+  private applyManualModeState(postproduction: Postproduction) {
+    if (
+      this._manualModePostproduction &&
+      this._manualModePostproduction !== postproduction
+    ) {
+      this.resetManualModeState();
+    }
+    this._manualModePostproduction = postproduction;
+
+    if (
+      this.turnOffOnManualMode &&
+      !this._manualModeEnabledOverridden &&
+      postproduction.enabled
+    ) {
+      this._previousEnabled = postproduction.enabled;
+      postproduction.enabled = false;
+      this._manualModeEnabledOverridden = true;
+    }
+
+    if (this.manualDefaultStyle !== postproduction.style) {
+      this.setStyleWithoutEvent(this.manualDefaultStyle, postproduction);
+      this._manualModeStyleOverridden = true;
+    }
+  }
+
+  private restoreManualModeState(
+    postproduction = this._manualModePostproduction,
+  ) {
+    if (!postproduction) return;
+    if (this._postproduction !== postproduction) {
+      this.resetManualModeState();
+      return;
+    }
+
+    if (this._manualModeEnabledOverridden) {
+      postproduction.enabled = this._previousEnabled;
+    }
+    if (this._manualModeStyleOverridden) {
+      this.setStyleWithoutEvent(this._previousStyle, postproduction);
+    }
+    this.resetManualModeState();
+  }
+
+  private resetManualModeState() {
+    this._manualModePostproduction = undefined;
+    this._manualModeEnabledOverridden = false;
+    this._manualModeStyleOverridden = false;
+  }
+
+  private cancelManualModeTimer() {
+    if (this._timeout === undefined) return;
+    clearTimeout(this._timeout);
+    this._timeout = undefined;
+  }
+
+  private discardManualModeUpdate() {
+    this.cancelManualModeTimer();
+    this.resetManualModeState();
   }
 
   private setPostproductionSize(size?: THREE.Vector2) {
