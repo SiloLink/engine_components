@@ -99,8 +99,14 @@ export class PostproductionRenderer extends RendererWith2D {
     const scene = this.currentWorld.scene.three;
     const camera = this.currentWorld.camera.three;
 
+    let hasManualModeOverride = false;
     if (isManualMode) {
       this.applyManualModeState(this.postproduction);
+      hasManualModeOverride =
+        this._manualModeEnabledOverridden || this._manualModeStyleOverridden;
+      if (!hasManualModeOverride) {
+        this.resetManualModeState();
+      }
     }
 
     if (this.postproduction.enabled) {
@@ -108,7 +114,7 @@ export class PostproductionRenderer extends RendererWith2D {
     } else {
       this.three.render(scene, camera);
     }
-    if (this.mode === OBC.RendererMode.MANUAL) {
+    if (this.mode === OBC.RendererMode.MANUAL && hasManualModeOverride) {
       // Use postproduction only on last frame
       this.cancelManualModeTimer();
 
