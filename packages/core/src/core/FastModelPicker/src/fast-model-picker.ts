@@ -5,6 +5,28 @@ import { Mouse } from "../../Raycasters/src/mouse";
 import { FragmentsManager } from "../../../fragments";
 
 /**
+ * Optional per-pick restriction for the Fragments meshes and draw ranges that
+ * may contribute to the offscreen identity, depth, and normal passes.
+ *
+ * The outer key is the Fragments model id. The inner map uses authoritative
+ * meshes from that model's `tiles` collection, with ranges expressed in the
+ * same index-buffer coordinates as `BufferGeometry.groups`.
+ *
+ * `undefined` preserves the unrestricted picker behavior. An empty map is an
+ * explicit restriction that allows no geometry to be picked.
+ */
+export type FastModelPickerCandidateMap = ReadonlyMap<
+  string,
+  ReadonlyMap<THREE.Mesh, readonly { start: number; count: number }[]>
+>;
+
+interface GeometryGroupSnapshot {
+  start: number;
+  count: number;
+  materialIndex?: number;
+}
+
+/**
  * GPU-readback picker that identifies what's under a screen position
  * without going through the worker raycast. Two granularities, same
  * render pass:
@@ -97,15 +119,13 @@ export class FastModelPicker implements Disposable {
    */
   private _normalMaterial: THREE.ShaderMaterial;
 
-  /**
-   * Cached original materials for the swap-render-restore pass.
-   * Populated in {@link applyIdMaterial}, drained in
-   * {@link restoreOriginalMaterials} after the render.
-   */
+  /** Cached original tile state for the identity swap-render-restore pass. */
   private _originalMaterials = new Map<
     THREE.Mesh,
     THREE.Material | THREE.Material[]
   >();
+  private _originalVisibility = new Map<THREE.Object3D, boolean>();
+  private _originalGroups = new Map<THREE.Mesh, GeometryGroupSnapshot[]>();
 
   /** Reused temporary material arrays keyed by material and group count. */
   private _materialArrays = new Map<
@@ -134,14 +154,6 @@ export class FastModelPicker implements Disposable {
   private _resizeEvent?: Event<THREE.Vector2>;
   private _resizeHandler?: (newSize: THREE.Vector2) => void;
 
-  /**
-   * LOD line meshes don't carry the per-vertex `id` attribute and would
-   * write whatever color their normal shader produces into the id
-   * buffer, faking hits. Hidden for the duration of the id render and
-   * restored after.
-   */
-  private _hiddenLods: THREE.Object3D[] = [];
-
   constructor(components: Components, world: World) {
     if (!world.renderer) {
       throw new Error("A renderer is needed for the FastModelPicker to work!");
@@ -164,9 +176,14 @@ export class FastModelPicker implements Disposable {
    *
    * @param position - Normalized device coords. Defaults to the
    *   picker's last known mouse position.
+   * @param candidates - Optional exact model/tile draw ranges allowed to
+   *   contribute. An empty map allows no hits.
    */
-  async getModelAt(position?: THREE.Vector2): Promise<string | null> {
-    const result = await this.runIdPass(position);
+  async getModelAt(
+    position?: THREE.Vector2,
+    candidates?: FastModelPickerCandidateMap,
+  ): Promise<string | null> {
+    const result = await this.runIdPass(position, candidates);
     if (!result) return null;
     return result.modelId;
   }
@@ -181,11 +198,14 @@ export class FastModelPicker implements Disposable {
    *
    * @param position - Normalized device coords. Defaults to the
    *   picker's last known mouse position.
+   * @param candidates - Optional exact model/tile draw ranges allowed to
+   *   contribute. An empty map allows no hits.
    */
   async getItemAt(
     position?: THREE.Vector2,
+    candidates?: FastModelPickerCandidateMap,
   ): Promise<{ modelId: string; localId: number; itemId: number } | null> {
-    const result = await this.runIdPass(position);
+    const result = await this.runIdPass(position, candidates);
     if (!result) return null;
     // The vertex `id` attribute now encodes the internal **itemId**
     // (the FlatBuffer `sample.item()` index, key for `boxes.sampleOf`)
@@ -218,8 +238,13 @@ export class FastModelPicker implements Disposable {
    *
    * @param position - Normalized device coords. Defaults to the
    *   picker's last known mouse position.
+   * @param candidates - Optional exact model/tile draw ranges allowed to
+   *   contribute. An empty map allows no hits.
    */
-  getPointAtSync(position?: THREE.Vector2): THREE.Vector3 | null {
+  getPointAtSync(
+    position?: THREE.Vector2,
+    candidates?: FastModelPickerCandidateMap,
+  ): THREE.Vector3 | null {
     if (!this.enabled) return null;
     if (!this._renderTarget || !this.world.renderer) return null;
 
@@ -227,7 +252,7 @@ export class FastModelPicker implements Disposable {
     if (!fragments.initialized || fragments.list.size === 0) return null;
 
     const pos = position ?? this.mouse.position;
-    const view = this.renderDepthPass(pos);
+    const view = this.renderDepthPass(pos, candidates);
     const pixel = this.readPixelAt(this._renderTarget, view.readX, view.readY);
     if (!pixel) return null;
     if (pixel[0] === 0 && pixel[1] === 0 && pixel[2] === 0 && pixel[3] === 0) {
@@ -245,9 +270,17 @@ export class FastModelPicker implements Disposable {
 
   /**
    * Asynchronous compatibility wrapper for {@link getPointAtSync}.
+   *
+   * @param position - Normalized device coords. Defaults to the
+   *   picker's last known mouse position.
+   * @param candidates - Optional exact model/tile draw ranges allowed to
+   *   contribute. An empty map allows no hits.
    */
-  async getPointAt(position?: THREE.Vector2): Promise<THREE.Vector3 | null> {
-    return this.getPointAtSync(position);
+  async getPointAt(
+    position?: THREE.Vector2,
+    candidates?: FastModelPickerCandidateMap,
+  ): Promise<THREE.Vector3 | null> {
+    return this.getPointAtSync(position, candidates);
   }
 
   /**
@@ -257,15 +290,23 @@ export class FastModelPicker implements Disposable {
    * Mirrors {@link getPointAt}'s structure: one `scene.overrideMaterial`
    * render with the normal-encoding shader, one 4-byte readback,
    * decode and renormalize.
+   *
+   * @param position - Normalized device coords. Defaults to the
+   *   picker's last known mouse position.
+   * @param candidates - Optional exact model/tile draw ranges allowed to
+   *   contribute. An empty map allows no hits.
    */
-  async getNormalAt(position?: THREE.Vector2): Promise<THREE.Vector3 | null> {
+  async getNormalAt(
+    position?: THREE.Vector2,
+    candidates?: FastModelPickerCandidateMap,
+  ): Promise<THREE.Vector3 | null> {
     if (!this.enabled) return null;
     if (!this._renderTarget || !this.world.renderer) return null;
     const fragments = this.components.get(FragmentsManager);
     if (!fragments.initialized || fragments.list.size === 0) return null;
 
     const pos = position ?? this.mouse.position;
-    const view = this.renderNormalPass(pos);
+    const view = this.renderNormalPass(pos, candidates);
     const pixel = this.readPixelAt(this._renderTarget, view.readX, view.readY);
     if (!pixel) return null;
     if (pixel[3] === 0) return null; // void pixel — nothing rendered here
@@ -287,8 +328,16 @@ export class FastModelPicker implements Disposable {
    * Returns `null` if the cursor is over empty space, the id pass
    * decodes to the void sentinel, or the depth round-trip yields the
    * far plane.
+   *
+   * @param position - Normalized device coords. Defaults to the
+   *   picker's last known mouse position.
+   * @param candidates - Optional exact model/tile draw ranges allowed to
+   *   contribute. An empty map allows no hits.
    */
-  async getFullPick(position?: THREE.Vector2): Promise<{
+  async getFullPick(
+    position?: THREE.Vector2,
+    candidates?: FastModelPickerCandidateMap,
+  ): Promise<{
     modelId: string;
     localId: number;
     /**
@@ -302,11 +351,11 @@ export class FastModelPicker implements Disposable {
     normal: THREE.Vector3 | null;
     distance: number;
   } | null> {
-    const item = await this.getItemAt(position);
+    const item = await this.getItemAt(position, candidates);
     if (!item) return null;
-    const point = await this.getPointAt(position);
+    const point = await this.getPointAt(position, candidates);
     if (!point) return null;
-    const normal = await this.getNormalAt(position);
+    const normal = await this.getNormalAt(position, candidates);
     const distance = point.distanceTo(this.world.camera.three.position);
     return { ...item, point, normal, distance };
   }
@@ -348,9 +397,10 @@ export class FastModelPicker implements Disposable {
     if (this._identityRenderTarget) this._identityRenderTarget.dispose();
     this._identityRenderTarget = undefined;
     this._originalMaterials.clear();
+    this._originalVisibility.clear();
+    this._originalGroups.clear();
     this._materialArrays.clear();
     this._lastIdentityPickStats = undefined;
-    this._hiddenLods.length = 0;
     this._identityModelRoots.clear();
     this.onDisposed.trigger();
     this.onDisposed.reset();
@@ -366,6 +416,7 @@ export class FastModelPicker implements Disposable {
    */
   private async runIdPass(
     position?: THREE.Vector2,
+    candidates?: FastModelPickerCandidateMap,
   ): Promise<{ modelId: string; itemId: number } | null> {
     if (!this.enabled) return null;
     if (!this._identityRenderTarget) return null;
@@ -375,7 +426,13 @@ export class FastModelPicker implements Disposable {
     if (!fragments.initialized || fragments.list.size === 0) return null;
 
     const prepareStartedAt = performance.now();
-    const indexToModel = this.applyIdMaterial();
+    let indexToModel: Map<number, string>;
+    try {
+      indexToModel = this.applyIdMaterial(candidates);
+    } catch (error) {
+      this.restoreOriginalMaterials();
+      throw error;
+    }
     const prepareMs = performance.now() - prepareStartedAt;
     if (indexToModel.size === 0) {
       const restoreStartedAt = performance.now();
@@ -452,7 +509,9 @@ export class FastModelPicker implements Disposable {
    * temporary `modelIndex → modelId` map the render pass uses to
    * disambiguate models.
    */
-  private applyIdMaterial(): Map<number, string> {
+  private applyIdMaterial(
+    candidates?: FastModelPickerCandidateMap,
+  ): Map<number, string> {
     const fragments = this.components.get(FragmentsManager);
     const indexToModel = new Map<number, string>();
     this._identityModelRoots.clear();
@@ -463,6 +522,8 @@ export class FastModelPicker implements Disposable {
 
     for (const [modelId, model] of fragments.list) {
       if (nextModelIndex > FastModelPicker.MAX_MODELS) break;
+      const modelCandidates = candidates?.get(modelId);
+      if (candidates && !modelCandidates) continue;
       const idMaterial = this.getIdMaterial(nextModelIndex);
       idMaterial.clippingPlanes = planes;
       idMaterial.clipping = planes.length > 0;
@@ -473,17 +534,27 @@ export class FastModelPicker implements Disposable {
         const geom = child.geometry as THREE.BufferGeometry | undefined;
         if (!geom) continue;
         if (!geom.attributes || !geom.attributes.id) {
-          if (child.visible) {
-            this._hiddenLods.push(child);
-            child.visible = false;
-          }
+          this.setTemporaryVisibility(this._originalVisibility, child, false);
           continue;
         }
+
+        if (modelCandidates) {
+          const ranges = modelCandidates.get(child);
+          if (!ranges || !this.applyCandidateGroups(child, ranges)) {
+            this.setTemporaryVisibility(this._originalVisibility, child, false);
+            continue;
+          }
+        }
+
         this._pickTileCount += 1;
         if (child.visible) this._pickVisibleTileCount += 1;
+        if (modelCandidates) {
+          this.setTemporaryVisibility(this._originalVisibility, child, true);
+        }
         this._originalMaterials.set(child, child.material);
         const original = child.material;
-        const len = Array.isArray(original) ? original.length : 1;
+        let len = 1;
+        if (!modelCandidates && Array.isArray(original)) len = original.length;
         child.material = this.getMaterialArray(idMaterial, len);
         hasOwnedMesh = true;
       }
@@ -624,12 +695,14 @@ export class FastModelPicker implements Disposable {
     const prevScissor = renderer.getScissor(new THREE.Vector4());
 
     const prevBackground = (scene as THREE.Scene).background;
-    const nonBimVisibility = this.hideNonBimMeshes(
-      scene,
-      fragments,
-      includedModelRoots,
-    );
+    const nonBimVisibility = new Map<THREE.Object3D, boolean>();
     try {
+      this.hideNonBimMeshes(
+        scene,
+        fragments,
+        includedModelRoots,
+        nonBimVisibility,
+      );
       (scene as THREE.Scene).background = null;
       renderer.setRenderTarget(target);
       renderer.setClearColor(0x000000, 0);
@@ -638,7 +711,7 @@ export class FastModelPicker implements Disposable {
       renderer.clear(true, true, false);
       renderer.render(scene, camera);
     } finally {
-      for (const [obj, was] of nonBimVisibility) obj.visible = was;
+      this.restoreVisibility(nonBimVisibility);
       renderer.setRenderTarget(prevTarget);
       renderer.setScissorTest(prevScissorTest);
       renderer.setScissor(prevScissor);
@@ -668,6 +741,7 @@ export class FastModelPicker implements Disposable {
   private renderWithTileMaterial(
     material: THREE.ShaderMaterial,
     ndc: THREE.Vector2,
+    candidates?: FastModelPickerCandidateMap,
   ) {
     const renderer = this.world.renderer!.three;
     const scene = this.world.scene.three;
@@ -692,48 +766,67 @@ export class FastModelPicker implements Disposable {
     // to a bogus point/normal instead of void. Null it for the render and
     // restore below (issues #737 / #773).
     const prevBackground = (scene as THREE.Scene).background;
-    // Per-mesh material + visibility swap. We only touch shells that
-    // carry the `id` attribute — those are the BIM tile shells.
-    // LOD-stage line meshes (no `id`) are hidden so they don't write
-    // into our pick buffer.
-    // Only touch shells that fragments currently has visible. Forcing
-    // hidden tiles visible leaks stale LOD-stage geometry into the
-    // pick — those tiles sit at slightly different depths than the
-    // active ones and would dominate `gl_FragCoord.z` at the cursor.
     const matSwap = new Map<THREE.Mesh, THREE.Material | THREE.Material[]>();
-    const hiddenLines: THREE.Object3D[] = [];
-    for (const [, model] of fragments.list) {
-      for (const [, child] of model.tiles) {
-        if (!(child instanceof THREE.Mesh)) continue;
-        const geom = child.geometry as THREE.BufferGeometry | undefined;
-        if (!geom) continue;
-        if (!geom.attributes || !geom.attributes.id) {
-          if (child.visible) {
-            hiddenLines.push(child);
-            child.visible = false;
-          }
-          continue;
-        }
-        // Mirror the id pass: we only rasterize tiles fragments has
-        // currently flagged visible. Forcing hidden tiles visible
-        // would render stale LOD-stage geometry that sits at slightly
-        // different depths than the active tiles.
-        if (!child.visible) continue;
-        matSwap.set(child, child.material);
-        // Wrap in an array so three honours `geometry.groups` (per-item
-        // visibility ranges). With a single Material, three draws the
-        // whole indexed geometry and the depth/normal at the cursor
-        // would reflect a hidden item. Length must match the original
-        // so highlight groups (materialIndex >= 1) also draw — see the
-        // longer note in `applyIdMaterial`.
-        const original = child.material;
-        const len = Array.isArray(original) ? original.length : 1;
-        child.material = this.getMaterialArray(material, len);
-      }
-    }
-
-    const nonBimVisibility = this.hideNonBimMeshes(scene, fragments);
+    const visibilitySwap = new Map<THREE.Object3D, boolean>();
+    const groupSwap = new Map<THREE.Mesh, GeometryGroupSnapshot[]>();
+    const includedModelRoots = candidates
+      ? new Set<THREE.Object3D>()
+      : undefined;
     try {
+      // Per-mesh material + visibility swap. In unrestricted mode this
+      // preserves the existing rule: only shells Fragments currently marks
+      // visible contribute. With candidates, exact item ranges are rendered
+      // even when their source tile is in a hidden LOD stage, matching the
+      // explicitly-visible filtered proxy owned by the caller.
+      for (const [modelId, model] of fragments.list) {
+        const modelCandidates = candidates?.get(modelId);
+        if (candidates && !modelCandidates) continue;
+        let hasCandidate = false;
+
+        for (const [, child] of model.tiles) {
+          if (!(child instanceof THREE.Mesh)) continue;
+          const geom = child.geometry as THREE.BufferGeometry | undefined;
+          if (!geom) continue;
+          if (!geom.attributes || !geom.attributes.id) {
+            this.setTemporaryVisibility(visibilitySwap, child, false);
+            continue;
+          }
+
+          if (modelCandidates) {
+            const ranges = modelCandidates.get(child);
+            if (
+              !ranges ||
+              !this.applyCandidateGroups(child, ranges, groupSwap)
+            ) {
+              this.setTemporaryVisibility(visibilitySwap, child, false);
+              continue;
+            }
+            this.setTemporaryVisibility(visibilitySwap, child, true);
+          } else if (!child.visible) {
+            continue;
+          }
+
+          matSwap.set(child, child.material);
+          const original = child.material;
+          let len = 1;
+          if (!modelCandidates && Array.isArray(original)) {
+            len = original.length;
+          }
+          child.material = this.getMaterialArray(material, len);
+          hasCandidate = true;
+        }
+
+        if (includedModelRoots && hasCandidate) {
+          includedModelRoots.add(model.object);
+        }
+      }
+
+      this.hideNonBimMeshes(
+        scene,
+        fragments,
+        includedModelRoots,
+        visibilitySwap,
+      );
       (scene as THREE.Scene).background = null;
       renderer.setRenderTarget(this._renderTarget!);
       renderer.setClearColor(0x000000, 0);
@@ -743,8 +836,8 @@ export class FastModelPicker implements Disposable {
       renderer.render(scene, view.camera);
     } finally {
       for (const [mesh, mat] of matSwap) mesh.material = mat;
-      for (const obj of hiddenLines) obj.visible = true;
-      for (const [obj, was] of nonBimVisibility) obj.visible = was;
+      this.restoreGroups(groupSwap);
+      this.restoreVisibility(visibilitySwap);
       renderer.setRenderTarget(prevTarget);
       renderer.setScissorTest(prevScissorTest);
       renderer.setScissor(prevScissor);
@@ -755,12 +848,18 @@ export class FastModelPicker implements Disposable {
     return view;
   }
 
-  private renderDepthPass(ndc: THREE.Vector2) {
-    return this.renderWithTileMaterial(this._depthMaterial, ndc);
+  private renderDepthPass(
+    ndc: THREE.Vector2,
+    candidates?: FastModelPickerCandidateMap,
+  ) {
+    return this.renderWithTileMaterial(this._depthMaterial, ndc, candidates);
   }
 
-  private renderNormalPass(ndc: THREE.Vector2) {
-    return this.renderWithTileMaterial(this._normalMaterial, ndc);
+  private renderNormalPass(
+    ndc: THREE.Vector2,
+    candidates?: FastModelPickerCandidateMap,
+  ) {
+    return this.renderWithTileMaterial(this._normalMaterial, ndc, candidates);
   }
 
   private restoreOriginalMaterials() {
@@ -768,9 +867,8 @@ export class FastModelPicker implements Disposable {
       mesh.material = mat;
     }
     this._originalMaterials.clear();
-
-    for (const obj of this._hiddenLods) obj.visible = true;
-    this._hiddenLods.length = 0;
+    this.restoreGroups(this._originalGroups);
+    this.restoreVisibility(this._originalVisibility);
     this._identityModelRoots.clear();
   }
 
@@ -799,19 +897,72 @@ export class FastModelPicker implements Disposable {
     return materials;
   }
 
+  private applyCandidateGroups(
+    mesh: THREE.Mesh,
+    ranges: readonly { start: number; count: number }[],
+    snapshots = this._originalGroups,
+  ) {
+    const validRanges = ranges
+      .map(({ start, count }) => ({
+        start,
+        count: count === 0xffffffff ? Infinity : count,
+      }))
+      .filter(
+        ({ start, count }) =>
+          Number.isInteger(start) &&
+          start >= 0 &&
+          (count === Infinity || (Number.isInteger(count) && count > 0)),
+      );
+    if (validRanges.length === 0) return false;
+
+    const geometry = mesh.geometry;
+    if (!snapshots.has(mesh)) {
+      snapshots.set(
+        mesh,
+        geometry.groups.map((group) => ({ ...group })),
+      );
+    }
+    geometry.clearGroups();
+    for (const { start, count } of validRanges) {
+      geometry.addGroup(start, count, 0);
+    }
+    return true;
+  }
+
+  private restoreGroups(snapshots: Map<THREE.Mesh, GeometryGroupSnapshot[]>) {
+    for (const [mesh, groups] of snapshots) {
+      mesh.geometry.groups = groups.map((group) => ({ ...group }));
+    }
+    snapshots.clear();
+  }
+
+  private setTemporaryVisibility(
+    snapshots: Map<THREE.Object3D, boolean>,
+    object: THREE.Object3D,
+    visible: boolean,
+  ) {
+    if (object.visible === visible) return;
+    if (!snapshots.has(object)) snapshots.set(object, object.visible);
+    object.visible = visible;
+  }
+
+  private restoreVisibility(snapshots: Map<THREE.Object3D, boolean>) {
+    for (const [object, visible] of snapshots) object.visible = visible;
+    snapshots.clear();
+  }
+
   private hideNonBimMeshes(
     scene: THREE.Object3D,
     fragments: FragmentsManager,
     includedModelRoots?: ReadonlySet<THREE.Object3D>,
+    visibility = new Map<THREE.Object3D, boolean>(),
   ) {
     const modelRoots = new Set<THREE.Object3D>();
     for (const [, model] of fragments.list) modelRoots.add(model.object);
-    const visibility = new Map<THREE.Object3D, boolean>();
     if (includedModelRoots) {
       for (const root of modelRoots) {
         if (includedModelRoots.has(root)) continue;
-        visibility.set(root, root.visible);
-        root.visible = false;
+        this.setTemporaryVisibility(visibility, root, false);
       }
     }
     const stack: THREE.Object3D[] = [scene];
@@ -819,8 +970,7 @@ export class FastModelPicker implements Disposable {
       const node = stack.pop()!;
       if (modelRoots.has(node)) continue;
       if (node !== scene && (node as THREE.Mesh).isMesh) {
-        visibility.set(node, node.visible);
-        node.visible = false;
+        this.setTemporaryVisibility(visibility, node, false);
       }
       for (const child of node.children) stack.push(child);
     }
