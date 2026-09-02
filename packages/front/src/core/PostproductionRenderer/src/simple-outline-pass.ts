@@ -8,17 +8,27 @@ import {
 const PALETTE_SIZE = 256;
 const DEFAULT_GROUP = "default";
 
+export type OutlineSurfaceMode = "none" | "source-material";
+
+interface DrawRange {
+  start: number;
+  count: number;
+}
+
 interface OutlineGroup {
   id: number;
   name: string;
   /** Container parented to the root scene; ghost meshes live here. */
   container: THREE.Group;
+  /** Container parented to the base-only source-material root. */
+  sourceContainer: THREE.Group;
   /** Dedicated material for this group, with its idColor uniform baked in. */
   material: THREE.ShaderMaterial;
   outlineColor: THREE.Color;
   fillColor: THREE.Color;
   fillOpacity: number;
   thickness: number;
+  surfaceMode: OutlineSurfaceMode;
   /**
    * Higher priority wins at coplanar pixels. Groups render in priority order;
    * the default less-equal depth test lets the later group resolve the tie.
@@ -42,6 +52,9 @@ interface OutlineGroup {
 interface OutlinedTileProxy {
   source: THREE.Mesh;
   proxy: THREE.Mesh;
+  sourceProxy: THREE.Mesh | null;
+  sourceMaterials: THREE.Material[];
+  ranges: DrawRange[];
   groupName: string;
 }
 
@@ -88,6 +101,7 @@ export class SimpleOutlinePass extends Pass {
   private _maskTarget: THREE.WebGLRenderTarget;
   private _compositeTarget: THREE.WebGLRenderTarget | null = null;
   private _rootScene: THREE.Scene;
+  private _sourceSurfaceRoot: THREE.Group;
   private _fsQuad: FullScreenQuad;
   private _copyQuad: FullScreenQuad;
   private _debugQuad: FullScreenQuad;
@@ -131,6 +145,7 @@ export class SimpleOutlinePass extends Pass {
 
     this._rootScene = new THREE.Scene();
     this._rootScene.background = null;
+    this._sourceSurfaceRoot = new THREE.Group();
 
     this._paletteData = new Uint8Array(PALETTE_SIZE * 2 * 4);
     this._paletteTexture = new THREE.DataTexture(
@@ -307,6 +322,25 @@ export class SimpleOutlinePass extends Pass {
   // ---------------------------------------------------------------------------
 
   /**
+   * Source-material proxies live under this detached root. The base pass
+   * attaches it to the world only for its unbiased render, then removes it
+   * before scene-wide edge and AO traversals.
+   */
+  get sourceSurfaceRoot() {
+    return this._sourceSurfaceRoot;
+  }
+
+  /** Synchronizes base-only proxies with their source tile before rendering. */
+  syncSourceSurfaces() {
+    for (const target of this._outlinedTiles.values()) {
+      const proxy = target.sourceProxy;
+      if (!proxy) continue;
+      this.syncProxyTransform(proxy, target.source);
+      proxy.visible = this.isHierarchyVisible(target.source);
+    }
+  }
+
+  /**
    * Creates a named outline group. Each group has its own container, material
    * (with id baked in) and visual config. No hard cap on active groups beyond
    * the palette size (255 concurrent).
@@ -314,7 +348,10 @@ export class SimpleOutlinePass extends Pass {
   addGroup(
     name: string,
     config?: Partial<
-      Omit<OutlineGroup, "id" | "name" | "container" | "material">
+      Omit<
+        OutlineGroup,
+        "id" | "name" | "container" | "sourceContainer" | "material"
+      >
     >,
   ) {
     let group = this._groups.get(name);
@@ -341,15 +378,21 @@ export class SimpleOutlinePass extends Pass {
     container.renderOrder = priority;
     this._rootScene.add(container);
 
+    const sourceContainer = new THREE.Group();
+    sourceContainer.name = `outline-source-surface-group:${name}`;
+    sourceContainer.renderOrder = priority;
+
     group = {
       id,
       name,
       container,
+      sourceContainer,
       material,
       outlineColor: config?.outlineColor?.clone() ?? new THREE.Color(0xffc800),
       fillColor: config?.fillColor?.clone() ?? new THREE.Color(0xffff00),
       fillOpacity: config?.fillOpacity ?? 0.3,
       thickness: config?.thickness ?? 2,
+      surfaceMode: config?.surfaceMode ?? "none",
       priority,
     };
 
@@ -366,7 +409,10 @@ export class SimpleOutlinePass extends Pass {
   configureGroup(
     name: string,
     config: Partial<
-      Omit<OutlineGroup, "id" | "name" | "container" | "material">
+      Omit<
+        OutlineGroup,
+        "id" | "name" | "container" | "sourceContainer" | "material"
+      >
     >,
   ) {
     const group = this._groups.get(name);
@@ -376,9 +422,17 @@ export class SimpleOutlinePass extends Pass {
     if (config.fillOpacity !== undefined)
       group.fillOpacity = config.fillOpacity;
     if (config.thickness !== undefined) group.thickness = config.thickness;
+    if (config.surfaceMode !== undefined)
+      group.surfaceMode = config.surfaceMode;
     if (config.priority !== undefined) {
       group.priority = config.priority;
       group.container.renderOrder = config.priority;
+      group.sourceContainer.renderOrder = config.priority;
+    }
+    for (const target of this._outlinedTiles.values()) {
+      if (target.groupName !== name) continue;
+      target.proxy.visible = this.groupNeedsMask(group);
+      this.refreshSourceProxy(target, group);
     }
     this.writePaletteEntry(group);
     this.updateMaxThickness();
@@ -394,13 +448,17 @@ export class SimpleOutlinePass extends Pass {
     if (!group) return;
     for (const [key, target] of this._outlinedTiles) {
       if (target.groupName !== name) continue;
-      target.proxy.removeFromParent();
+      this.destroyOutlinedTileProxy(target);
       this._outlinedTiles.delete(key);
     }
     while (group.container.children.length) {
       group.container.children[0].removeFromParent();
     }
+    while (group.sourceContainer.children.length) {
+      group.sourceContainer.children[0].removeFromParent();
+    }
     group.container.removeFromParent();
+    group.sourceContainer.removeFromParent();
     group.material.dispose();
     this._groups.delete(name);
     this._groupsById.delete(group.id);
@@ -458,20 +516,19 @@ export class SimpleOutlinePass extends Pass {
     const key = this.getOutlinedTileKey(tile, groupName);
     const existing = this._outlinedTiles.get(key);
     if (existing) {
-      const proxy = existing.proxy;
-      const proxyGeom = proxy.geometry;
-      proxyGeom.clearGroups();
-      this.fillProxyGroups(proxyGeom, chunks);
+      existing.ranges = this.copyRanges(chunks);
+      this.refreshAliasedGeometry(existing.proxy.geometry, tile.geometry);
+      this.fillProxyGroups(existing.proxy.geometry, existing.ranges);
+      existing.proxy.visible = this.groupNeedsMask(group);
+      this.refreshSourceProxy(existing, group);
       return;
     }
 
     const sourceGeom = tile.geometry;
     const proxyGeom = new THREE.BufferGeometry();
-    proxyGeom.attributes = sourceGeom.attributes;
-    if (sourceGeom.index) proxyGeom.setIndex(sourceGeom.index);
-    proxyGeom.boundingBox = sourceGeom.boundingBox;
-    proxyGeom.boundingSphere = sourceGeom.boundingSphere;
-    this.fillProxyGroups(proxyGeom, chunks);
+    this.refreshAliasedGeometry(proxyGeom, sourceGeom);
+    const ranges = this.copyRanges(chunks);
+    this.fillProxyGroups(proxyGeom, ranges);
 
     // Material assigned as `Material[]`, not a single `Material`. Three's
     // `WebGLRenderer.renderObject` only honors `geometry.groups` when the
@@ -483,9 +540,36 @@ export class SimpleOutlinePass extends Pass {
     proxy.matrixWorldAutoUpdate = false;
     proxy.frustumCulled = false; // matrix is owned by source; trust it
     proxy.matrixWorld.copy(tile.matrixWorld);
+    proxy.visible = this.groupNeedsMask(group);
 
     group.container.add(proxy);
-    this._outlinedTiles.set(key, { source: tile, proxy, groupName });
+    const target: OutlinedTileProxy = {
+      source: tile,
+      proxy,
+      sourceProxy: null,
+      sourceMaterials: [],
+      ranges,
+      groupName,
+    };
+    this._outlinedTiles.set(key, target);
+    this.refreshSourceProxy(target, group);
+  }
+
+  /**
+   * Rebuilds an attached proxy from the tile's current material slots and
+   * geometry groups without resolving item chunks again in the worker.
+   */
+  refreshOutlinedTile(tile: THREE.Mesh, groupName?: string) {
+    if (groupName !== undefined) {
+      const target = this._outlinedTiles.get(
+        this.getOutlinedTileKey(tile, groupName),
+      );
+      if (target) this.refreshOutlinedTileProxy(target);
+      return;
+    }
+    for (const target of this._outlinedTiles.values()) {
+      if (target.source === tile) this.refreshOutlinedTileProxy(target);
+    }
   }
 
   /**
@@ -507,14 +591,14 @@ export class SimpleOutlinePass extends Pass {
       const key = this.getOutlinedTileKey(tile, groupName);
       const target = this._outlinedTiles.get(key);
       if (!target) return;
-      target.proxy.removeFromParent();
+      this.destroyOutlinedTileProxy(target);
       this._outlinedTiles.delete(key);
       return;
     }
 
     for (const [key, target] of this._outlinedTiles) {
       if (target.source !== tile) continue;
-      target.proxy.removeFromParent();
+      this.destroyOutlinedTileProxy(target);
       this._outlinedTiles.delete(key);
     }
   }
@@ -623,7 +707,12 @@ export class SimpleOutlinePass extends Pass {
     // `matrixWorld` is updated by three when the model gets transformed.
     if (this._outlinedTiles.size > 0) {
       for (const target of this._outlinedTiles.values()) {
-        target.proxy.matrixWorld.copy(target.source.matrixWorld);
+        this.syncProxyTransform(target.proxy, target.source);
+        const group = this._groups.get(target.groupName);
+        target.proxy.visible =
+          group !== undefined &&
+          this.groupNeedsMask(group) &&
+          this.isHierarchyVisible(target.source);
       }
     }
 
@@ -697,9 +786,8 @@ export class SimpleOutlinePass extends Pass {
     // Drop proxies but never call `proxy.geometry.dispose()`: see the
     // comment on `detachOutlinedTile` — disposing would cascade to the
     // aliased source attributes and crash the next source render.
-    for (const target of this._outlinedTiles.values()) {
-      target.proxy.removeFromParent();
-    }
+    for (const target of this._outlinedTiles.values())
+      this.destroyOutlinedTileProxy(target);
     this._outlinedTiles.clear();
 
     for (const group of this._groups.values()) {
@@ -707,10 +795,15 @@ export class SimpleOutlinePass extends Pass {
         group.container.children[0].removeFromParent();
       }
       group.container.removeFromParent();
+      while (group.sourceContainer.children.length) {
+        group.sourceContainer.children[0].removeFromParent();
+      }
+      group.sourceContainer.removeFromParent();
       group.material.dispose();
     }
     this._groups.clear();
     this._groupsById.clear();
+    this._sourceSurfaceRoot.clear();
   }
 
   private shouldStageComposite(
@@ -743,17 +836,163 @@ export class SimpleOutlinePass extends Pass {
    */
   private fillProxyGroups(
     proxyGeom: THREE.BufferGeometry,
-    chunks: { position: ArrayLike<number>; size: ArrayLike<number> },
+    ranges: readonly DrawRange[],
   ) {
-    const positions = chunks.position;
-    const sizes = chunks.size;
-    const n = Math.min(positions.length, sizes.length);
-    for (let i = 0; i < n; i++) {
-      const start = positions[i];
-      const raw = sizes[i];
-      const count = raw === 0xffffffff ? Infinity : raw;
-      proxyGeom.addGroup(start, count, 0);
+    proxyGeom.clearGroups();
+    for (const range of ranges) proxyGeom.addGroup(range.start, range.count, 0);
+  }
+
+  private copyRanges(chunks: {
+    position: ArrayLike<number>;
+    size: ArrayLike<number>;
+  }) {
+    const ranges: DrawRange[] = [];
+    const count = Math.min(chunks.position.length, chunks.size.length);
+    for (let i = 0; i < count; i++) {
+      const size = chunks.size[i];
+      ranges.push({
+        start: chunks.position[i],
+        count: size === 0xffffffff ? Infinity : size,
+      });
     }
+    return ranges;
+  }
+
+  private refreshAliasedGeometry(
+    proxy: THREE.BufferGeometry,
+    source: THREE.BufferGeometry,
+  ) {
+    proxy.attributes = source.attributes;
+    proxy.index = source.index;
+    proxy.morphAttributes = source.morphAttributes;
+    proxy.morphTargetsRelative = source.morphTargetsRelative;
+    proxy.boundingBox = source.boundingBox;
+    proxy.boundingSphere = source.boundingSphere;
+    proxy.drawRange = { ...source.drawRange };
+  }
+
+  private refreshOutlinedTileProxy(target: OutlinedTileProxy) {
+    const group = this._groups.get(target.groupName);
+    if (!group) return;
+    this.refreshAliasedGeometry(target.proxy.geometry, target.source.geometry);
+    this.fillProxyGroups(target.proxy.geometry, target.ranges);
+    target.proxy.visible = this.groupNeedsMask(group);
+    this.refreshSourceProxy(target, group);
+  }
+
+  private refreshSourceProxy(target: OutlinedTileProxy, group: OutlineGroup) {
+    if (group.surfaceMode !== "source-material") {
+      this.destroySourceProxy(target);
+      return;
+    }
+
+    let sourceProxy = target.sourceProxy;
+    if (!sourceProxy) {
+      sourceProxy = new THREE.Mesh(new THREE.BufferGeometry(), []);
+      sourceProxy.matrixAutoUpdate = false;
+      sourceProxy.matrixWorldAutoUpdate = false;
+      sourceProxy.frustumCulled = false;
+      target.sourceProxy = sourceProxy;
+      if (!group.sourceContainer.parent) {
+        this._sourceSurfaceRoot.add(group.sourceContainer);
+      }
+      group.sourceContainer.add(sourceProxy);
+    }
+
+    this.disposeSourceMaterials(target);
+    this.refreshAliasedGeometry(sourceProxy.geometry, target.source.geometry);
+    sourceProxy.geometry.clearGroups();
+
+    const sourceMaterials = Array.isArray(target.source.material)
+      ? target.source.material
+      : [target.source.material];
+    const clonesBySource = new Map<THREE.Material, number>();
+    const sourceGroups = target.source.geometry.groups;
+    for (const sourceGroup of sourceGroups) {
+      const sourceStart = sourceGroup.start;
+      const sourceEnd = this.rangeEnd(sourceStart, sourceGroup.count);
+      for (const selected of target.ranges) {
+        const selectedEnd = this.rangeEnd(selected.start, selected.count);
+        const start = Math.max(selected.start, sourceStart);
+        const end = Math.min(selectedEnd, sourceEnd);
+        if (end <= start) continue;
+
+        const sourceMaterial = sourceMaterials[sourceGroup.materialIndex ?? 0];
+        if (!sourceMaterial) continue;
+        let materialIndex = clonesBySource.get(sourceMaterial);
+        if (materialIndex === undefined) {
+          const clone = sourceMaterial.clone();
+          materialIndex = target.sourceMaterials.length;
+          target.sourceMaterials.push(clone);
+          clonesBySource.set(sourceMaterial, materialIndex);
+        }
+        sourceProxy.geometry.addGroup(
+          start,
+          end === Infinity ? Infinity : end - start,
+          materialIndex,
+        );
+      }
+    }
+
+    if (sourceProxy.geometry.groups.length === 0) {
+      this.destroySourceProxy(target);
+      return;
+    }
+
+    sourceProxy.material = target.sourceMaterials;
+    sourceProxy.onBeforeRender = target.source.onBeforeRender;
+    sourceProxy.onAfterRender = target.source.onAfterRender;
+    sourceProxy.renderOrder = target.source.renderOrder;
+    sourceProxy.layers.mask = target.source.layers.mask;
+    sourceProxy.visible = this.isHierarchyVisible(target.source);
+    this.syncProxyTransform(sourceProxy, target.source);
+  }
+
+  private destroyOutlinedTileProxy(target: OutlinedTileProxy) {
+    target.proxy.removeFromParent();
+    this.destroySourceProxy(target);
+  }
+
+  private destroySourceProxy(target: OutlinedTileProxy) {
+    if (target.sourceProxy) {
+      target.sourceProxy.removeFromParent();
+      // Do not dispose the lightweight geometry wrapper: its attributes and
+      // index are aliases owned by the Fragments tile.
+      target.sourceProxy = null;
+    }
+    this.disposeSourceMaterials(target);
+    const group = this._groups.get(target.groupName);
+    if (group?.sourceContainer.children.length === 0) {
+      group.sourceContainer.removeFromParent();
+    }
+  }
+
+  private disposeSourceMaterials(target: OutlinedTileProxy) {
+    for (const material of target.sourceMaterials) material.dispose();
+    target.sourceMaterials = [];
+  }
+
+  private syncProxyTransform(proxy: THREE.Mesh, source: THREE.Mesh) {
+    proxy.matrixWorld.copy(source.matrixWorld);
+    proxy.renderOrder = source.renderOrder;
+    proxy.layers.mask = source.layers.mask;
+  }
+
+  private isHierarchyVisible(source: THREE.Object3D) {
+    let current: THREE.Object3D | null = source;
+    while (current) {
+      if (!current.visible) return false;
+      current = current.parent;
+    }
+    return true;
+  }
+
+  private groupNeedsMask(group: OutlineGroup) {
+    return group.thickness > 0 || group.fillOpacity > 0;
+  }
+
+  private rangeEnd(start: number, count: number) {
+    return count === Infinity ? Infinity : start + count;
   }
 
   private getOutlinedTileKey(tile: THREE.Mesh, groupName: string) {

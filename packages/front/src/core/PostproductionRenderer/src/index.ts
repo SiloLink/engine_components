@@ -450,6 +450,9 @@ export class Postproduction {
       () => this._sceneDepthTexture,
       reversedDepth,
     );
+    basePass.addBaseOnlyObject(this._simpleOutlinePass.sourceSurfaceRoot, () =>
+      this._simpleOutlinePass?.syncSourceSurfaces(),
+    );
 
     this._excludedObjectsPass = new ExcludedObjectsPass(
       this._renderer,

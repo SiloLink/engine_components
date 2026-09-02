@@ -25,12 +25,32 @@ export interface OutlineGroupConfig {
   fillOpacity?: number;
   thickness?: number;
   /**
+   * Optionally render the selected geometry with its current source material
+   * in the base pass. This is independent of colored fill and outline styling.
+   */
+  surfaceMode?: "none" | "source-material";
+  /**
    * Higher priority groups win at coplanar pixels (z-fighting resolution
    * between groups). Default is 0. Use integer steps; a difference of 1 is
    * enough to resolve typical coplanar cases.
    */
   priority?: number;
 }
+
+export interface OutlinerPickCandidateRange {
+  readonly start: number;
+  readonly count: number;
+}
+
+/**
+ * Synchronous, defensive draw ranges suitable for a filtered fast-pick pass.
+ * Structurally compatible with `FastModelPickerCandidateMap` in newer core
+ * versions while keeping components-front buildable against its pinned core.
+ */
+export type OutlinerPickCandidateMap = ReadonlyMap<
+  string,
+  ReadonlyMap<THREE.Mesh, readonly OutlinerPickCandidateRange[]>
+>;
 
 interface OutlineGroupState {
   map: OBC.ModelIdMap;
@@ -41,6 +61,8 @@ interface OutlineGroupState {
    * so we can detach tiles that no longer belong to the group.
    */
   attached: Map<string, Set<THREE.Mesh>>;
+  /** Last successfully resolved chunks, keyed by model and current tile. */
+  resolved: Map<string, Map<THREE.Mesh, readonly OutlinerPickCandidateRange[]>>;
   activeStyles: Set<string>;
   styleCallbacks: {
     [style: string]: {
@@ -80,10 +102,12 @@ export class Outliner extends OBC.Component implements OBC.Disposable {
         const passGroup = previousPass.getGroup(name);
         if (passGroup) {
           state.config = {
+            ...state.config,
             color: passGroup.outlineColor.clone(),
             fillColor: passGroup.fillColor.clone(),
             fillOpacity: passGroup.fillOpacity,
             thickness: passGroup.thickness,
+            surfaceMode: passGroup.surfaceMode,
             priority: passGroup.priority,
           };
         }
@@ -340,6 +364,56 @@ export class Outliner extends OBC.Component implements OBC.Disposable {
   }
 
   /**
+   * Returns the already-resolved tile ranges for the requested groups without
+   * a worker call. The returned maps, arrays and range objects are defensive
+   * copies; overlapping or adjacent ranges are coalesced per tile.
+   */
+  getPickCandidates(groupNames: Iterable<string>): OutlinerPickCandidateMap {
+    const collected = new Map<
+      string,
+      Map<THREE.Mesh, OutlinerPickCandidateRange[]>
+    >();
+
+    for (const name of new Set(groupNames)) {
+      const state = this._groups.get(name);
+      if (!state) continue;
+      for (const [modelId, tiles] of state.resolved) {
+        let modelCandidates = collected.get(modelId);
+        if (!modelCandidates) {
+          modelCandidates = new Map();
+          collected.set(modelId, modelCandidates);
+        }
+        for (const [tile, ranges] of tiles) {
+          let tileRanges = modelCandidates.get(tile);
+          if (!tileRanges) {
+            tileRanges = [];
+            modelCandidates.set(tile, tileRanges);
+          }
+          for (const range of ranges)
+            tileRanges.push({ start: range.start, count: range.count });
+        }
+      }
+    }
+
+    const result = new Map<
+      string,
+      ReadonlyMap<THREE.Mesh, readonly OutlinerPickCandidateRange[]>
+    >();
+    for (const [modelId, tiles] of collected) {
+      const modelCandidates = new Map<
+        THREE.Mesh,
+        readonly OutlinerPickCandidateRange[]
+      >();
+      for (const [tile, ranges] of tiles) {
+        const coalesced = this.coalesceRanges(ranges);
+        if (coalesced.length > 0) modelCandidates.set(tile, coalesced);
+      }
+      if (modelCandidates.size > 0) result.set(modelId, modelCandidates);
+    }
+    return result;
+  }
+
+  /**
    * Wires a Highlighter style to a specific outline group. Equivalent to
    * `outliner.styles.add(style)` but routes the items to the given group
    * instead of the default.
@@ -362,6 +436,7 @@ export class Outliner extends OBC.Component implements OBC.Disposable {
   async addItems(modelIdMap: OBC.ModelIdMap, group = DEFAULT_GROUP) {
     const state = this.ensureGroup(group);
     OBC.ModelIdMapUtils.add(state.map, modelIdMap);
+    state.resolved = new Map();
     await this.updateGroup(group, modelIdMap);
   }
 
@@ -372,6 +447,7 @@ export class Outliner extends OBC.Component implements OBC.Disposable {
     const state = this._groups.get(group);
     if (!state) return;
     OBC.ModelIdMapUtils.remove(state.map, modelIdMap);
+    state.resolved = new Map();
     await this.updateGroup(group);
   }
 
@@ -414,6 +490,7 @@ export class Outliner extends OBC.Component implements OBC.Disposable {
       if (!state) return;
       this.invalidateGroup(group);
       state.map = {};
+      state.resolved = new Map();
       state.activeStyles.clear();
       this.detachAll(state, group);
       if (group === DEFAULT_GROUP) this.cleanPoints();
@@ -423,6 +500,7 @@ export class Outliner extends OBC.Component implements OBC.Disposable {
     for (const [name, state] of this._groups) {
       this.invalidateGroup(name);
       state.map = {};
+      state.resolved = new Map();
       state.activeStyles.clear();
       this.detachAll(state, name);
     }
@@ -461,6 +539,7 @@ export class Outliner extends OBC.Component implements OBC.Disposable {
       fillColor: config.fillColor,
       fillOpacity: config.fillOpacity,
       thickness: config.thickness,
+      surfaceMode: config.surfaceMode,
       priority: config.priority,
     };
   }
@@ -474,6 +553,7 @@ export class Outliner extends OBC.Component implements OBC.Disposable {
       fillColor: update.fillColor?.clone() ?? current.fillColor?.clone(),
       fillOpacity: update.fillOpacity ?? current.fillOpacity,
       thickness: update.thickness ?? current.thickness,
+      surfaceMode: update.surfaceMode ?? current.surfaceMode,
       priority: update.priority ?? current.priority,
     };
   }
@@ -490,6 +570,7 @@ export class Outliner extends OBC.Component implements OBC.Disposable {
       map: {},
       config: {},
       attached: new Map(),
+      resolved: new Map(),
       activeStyles: new Set(),
       styleCallbacks: {},
     };
@@ -571,6 +652,7 @@ export class Outliner extends OBC.Component implements OBC.Disposable {
       maps.push(map);
     }
     state.map = OBC.ModelIdMapUtils.join(maps);
+    state.resolved = new Map();
     await this.updateGroup(groupName);
   }
 
@@ -630,6 +712,10 @@ export class Outliner extends OBC.Component implements OBC.Disposable {
       previouslyAttached.set(modelId, new Set(tiles));
     }
     const nextAttached = new Map<string, Set<THREE.Mesh>>();
+    const nextResolved = new Map<
+      string,
+      Map<THREE.Mesh, readonly OutlinerPickCandidateRange[]>
+    >();
 
     // Run the chunk query per model in parallel. Each query returns one
     // entry per affected tile with parallel `position` / `size` arrays.
@@ -673,6 +759,10 @@ export class Outliner extends OBC.Component implements OBC.Disposable {
       const currentModel = fragments.list.get(modelId);
       if (currentModel !== queriedModel) continue;
       const attached = new Set<THREE.Mesh>();
+      const resolved = new Map<
+        THREE.Mesh,
+        readonly OutlinerPickCandidateRange[]
+      >();
       for (const entry of chunks) {
         const tile = currentModel.tiles.get(entry.tileId);
         if (!tile) continue;
@@ -682,8 +772,10 @@ export class Outliner extends OBC.Component implements OBC.Disposable {
           name,
         );
         attached.add(tile);
+        resolved.set(tile, this.copyChunkRanges(entry.position, entry.size));
       }
       nextAttached.set(modelId, attached);
+      if (resolved.size > 0) nextResolved.set(modelId, resolved);
     }
 
     // Detach proxies that were attached before but aren't in the new
@@ -697,6 +789,7 @@ export class Outliner extends OBC.Component implements OBC.Disposable {
     }
 
     state.attached = nextAttached;
+    state.resolved = nextResolved;
   }
 
   private isGroupUpdateCurrent(
@@ -742,11 +835,13 @@ export class Outliner extends OBC.Component implements OBC.Disposable {
   private detachAll(state: OutlineGroupState, group = DEFAULT_GROUP) {
     if (!this.world) {
       state.attached = new Map();
+      state.resolved = new Map();
       return;
     }
     const pass = this._outlinePass;
     if (!pass) {
       state.attached = new Map();
+      state.resolved = new Map();
       return;
     }
     this.detachAllFromPass(state, group, pass);
@@ -761,6 +856,7 @@ export class Outliner extends OBC.Component implements OBC.Disposable {
       for (const tile of tiles) pass.detachOutlinedTile(tile, group);
     }
     state.attached = new Map();
+    state.resolved = new Map();
   }
 
   /**
@@ -782,13 +878,18 @@ export class Outliner extends OBC.Component implements OBC.Disposable {
     const refresh = () => {
       this.refreshModel(modelId);
     };
+    const refreshAttached = () => {
+      this.refreshAttachedModel(modelId);
+    };
     model.tiles.onItemSet.add(refresh);
     model.tiles.onItemDeleted.add(refresh);
+    model.onViewUpdated.add(refreshAttached);
     this._tileListeners.set(modelId, {
       model,
       unbind: () => {
         model.tiles.onItemSet.remove(refresh);
         model.tiles.onItemDeleted.remove(refresh);
+        model.onViewUpdated.remove(refreshAttached);
       },
     });
   }
@@ -820,6 +921,71 @@ export class Outliner extends OBC.Component implements OBC.Disposable {
         );
       }
     }
+  }
+
+  /**
+   * UPDATE requests mutate a loaded tile's material array and geometry groups
+   * in place, without firing DataMap set/delete events. Refresh the existing
+   * proxies synchronously at the model's view-finished boundary, reusing the
+   * committed worker chunks.
+   */
+  private refreshAttachedModel(modelId: string) {
+    const pass = this._outlinePass;
+    if (!pass) return;
+    for (const [groupName, state] of this._groups) {
+      const tiles = state.attached.get(modelId);
+      if (!tiles) continue;
+      for (const tile of tiles) pass.refreshOutlinedTile(tile, groupName);
+    }
+  }
+
+  private copyChunkRanges(
+    positions: ArrayLike<number>,
+    sizes: ArrayLike<number>,
+  ): readonly OutlinerPickCandidateRange[] {
+    const ranges: OutlinerPickCandidateRange[] = [];
+    const count = Math.min(positions.length, sizes.length);
+    for (let i = 0; i < count; i++) {
+      const size = sizes[i];
+      ranges.push({
+        start: positions[i],
+        count: size === 0xffffffff ? Infinity : size,
+      });
+    }
+    return ranges;
+  }
+
+  private coalesceRanges(
+    input: readonly OutlinerPickCandidateRange[],
+  ): readonly OutlinerPickCandidateRange[] {
+    const ranges = input
+      .filter(
+        ({ start, count }) => Number.isFinite(start) && start >= 0 && count > 0,
+      )
+      .map(({ start, count }) => ({ start, count }))
+      .sort((a, b) => a.start - b.start);
+    if (ranges.length === 0) return [];
+
+    const result: OutlinerPickCandidateRange[] = [];
+    let start = ranges[0].start;
+    let end = this.rangeEnd(ranges[0]);
+    for (let i = 1; i < ranges.length; i++) {
+      const range = ranges[i];
+      const nextEnd = this.rangeEnd(range);
+      if (range.start <= end) {
+        end = Math.max(end, nextEnd);
+        continue;
+      }
+      result.push({ start, count: end === Infinity ? Infinity : end - start });
+      start = range.start;
+      end = nextEnd;
+    }
+    result.push({ start, count: end === Infinity ? Infinity : end - start });
+    return result;
+  }
+
+  private rangeEnd(range: OutlinerPickCandidateRange) {
+    return range.count === Infinity ? Infinity : range.start + range.count;
   }
 
   private cleanPoints() {
