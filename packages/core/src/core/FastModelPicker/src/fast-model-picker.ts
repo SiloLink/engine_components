@@ -11,6 +11,8 @@ import { FragmentsManager } from "../../../fragments";
  * The outer key is the Fragments model id. The inner map uses authoritative
  * meshes from that model's `tiles` collection, with ranges expressed in the
  * same index-buffer coordinates as `BufferGeometry.groups`.
+ * Candidates restrict the currently drawable ranges; they never reveal hidden
+ * tiles, materials, or items.
  *
  * `undefined` preserves the unrestricted picker behavior. An empty map is an
  * explicit restriction that allows no geometry to be picked.
@@ -531,6 +533,7 @@ export class FastModelPicker implements Disposable {
 
       for (const [, child] of model.tiles) {
         if (!(child instanceof THREE.Mesh)) continue;
+        if (modelCandidates && !child.visible) continue;
         const geom = child.geometry as THREE.BufferGeometry | undefined;
         if (!geom) continue;
         if (!geom.attributes || !geom.attributes.id) {
@@ -548,9 +551,6 @@ export class FastModelPicker implements Disposable {
 
         this._pickTileCount += 1;
         if (child.visible) this._pickVisibleTileCount += 1;
-        if (modelCandidates) {
-          this.setTemporaryVisibility(this._originalVisibility, child, true);
-        }
         this._originalMaterials.set(child, child.material);
         const original = child.material;
         let len = 1;
@@ -773,11 +773,8 @@ export class FastModelPicker implements Disposable {
       ? new Set<THREE.Object3D>()
       : undefined;
     try {
-      // Per-mesh material + visibility swap. In unrestricted mode this
-      // preserves the existing rule: only shells Fragments currently marks
-      // visible contribute. With candidates, exact item ranges are rendered
-      // even when their source tile is in a hidden LOD stage, matching the
-      // explicitly-visible filtered proxy owned by the caller.
+      // Swap materials only on visible shells. Candidate ranges further
+      // restrict the source groups without changing Fragments visibility.
       for (const [modelId, model] of fragments.list) {
         const modelCandidates = candidates?.get(modelId);
         if (candidates && !modelCandidates) continue;
@@ -785,6 +782,7 @@ export class FastModelPicker implements Disposable {
 
         for (const [, child] of model.tiles) {
           if (!(child instanceof THREE.Mesh)) continue;
+          if (!child.visible) continue;
           const geom = child.geometry as THREE.BufferGeometry | undefined;
           if (!geom) continue;
           if (!geom.attributes || !geom.attributes.id) {
@@ -801,9 +799,6 @@ export class FastModelPicker implements Disposable {
               this.setTemporaryVisibility(visibilitySwap, child, false);
               continue;
             }
-            this.setTemporaryVisibility(visibilitySwap, child, true);
-          } else if (!child.visible) {
-            continue;
           }
 
           matSwap.set(child, child.material);
@@ -913,9 +908,31 @@ export class FastModelPicker implements Disposable {
           start >= 0 &&
           (count === Infinity || (Number.isInteger(count) && count > 0)),
       );
-    if (validRanges.length === 0) return false;
-
     const geometry = mesh.geometry;
+    const original = mesh.material;
+    const sourceRanges = Array.isArray(original)
+      ? geometry.groups.filter(
+          (group) => original[group.materialIndex ?? 0]?.visible,
+        )
+      : original.visible
+        ? [geometry.drawRange]
+        : [];
+    const drawStart = geometry.drawRange.start;
+    const drawEnd = drawStart + geometry.drawRange.count;
+    const drawableRanges: { start: number; count: number }[] = [];
+    for (const candidate of validRanges) {
+      for (const source of sourceRanges) {
+        const start = Math.max(candidate.start, source.start, drawStart);
+        const end = Math.min(
+          candidate.start + candidate.count,
+          source.start + source.count,
+          drawEnd,
+        );
+        if (end > start) drawableRanges.push({ start, count: end - start });
+      }
+    }
+    if (drawableRanges.length === 0) return false;
+
     if (!snapshots.has(mesh)) {
       snapshots.set(
         mesh,
@@ -923,7 +940,7 @@ export class FastModelPicker implements Disposable {
       );
     }
     geometry.clearGroups();
-    for (const { start, count } of validRanges) {
+    for (const { start, count } of drawableRanges) {
       geometry.addGroup(start, count, 0);
     }
     return true;

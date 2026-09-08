@@ -11,7 +11,14 @@ const CANDIDATE_RANGES = [
 
 function makeShell({ visible = true, groups = [] } = {}) {
   const geometry = new THREE.BufferGeometry();
-  geometry.setAttribute("id", new THREE.Uint32BufferAttribute([1, 1, 1], 1));
+  geometry.setAttribute(
+    "id",
+    new THREE.Uint32BufferAttribute(new Uint32Array(60).fill(1), 1),
+  );
+  geometry.setAttribute(
+    "position",
+    new THREE.Float32BufferAttribute(new Float32Array(180), 3),
+  );
   geometry.groups = groups.map((group) => ({ ...group }));
   const material = [
     new THREE.MeshBasicMaterial(),
@@ -60,10 +67,10 @@ function makeRenderer() {
   };
 }
 
-function createHarness() {
+function createHarness({ candidateVisible = false } = {}) {
   const candidate = makeShell({
-    visible: false,
-    groups: [{ start: 0, count: 30 }],
+    visible: candidateVisible,
+    groups: [{ start: 0, count: 30, materialIndex: 0 }],
   });
   const context = makeShell({
     groups: [{ start: 0, count: 42, materialIndex: 2 }],
@@ -300,7 +307,7 @@ test("identity, depth, and normal passes render only candidate ranges", async ()
         harness.picker.getNormalAt(PICK_POSITION, harness.candidates),
     },
   ]) {
-    const harness = createHarness();
+    const harness = createHarness({ candidateVisible: true });
     let renders = 0;
     harness.renderer.onRender = () => {
       renders += 1;
@@ -326,7 +333,7 @@ test("candidate state is restored when identity or tile-material renders throw",
         harness.picker.getPointAtSync(PICK_POSITION, harness.candidates),
     },
   ]) {
-    const harness = createHarness();
+    const harness = createHarness({ candidateVisible: true });
     harness.renderer.onRender = () => {
       assertCandidatePassState(
         harness,
@@ -342,6 +349,45 @@ test("candidate state is restored when identity or tile-material renders throw",
     assertSourceStateRestored(harness);
   }
 });
+
+for (const method of ["getModelAt", "getPointAtSync", "getNormalAt"]) {
+  test(`${method} candidates cannot revive a hidden tile`, async () => {
+    const harness = createHarness();
+    harness.renderer.onRender = () =>
+      assert.equal(harness.candidate.visible, false);
+    await harness.picker[method](PICK_POSITION, harness.candidates);
+    assertSourceStateRestored(harness);
+  });
+
+  test(`${method} intersects candidates with drawable groups and drawRange`, async () => {
+    const harness = createHarness({ candidateVisible: true });
+    const { candidate } = harness;
+    candidate.geometry.groups = [
+      { start: 0, count: 6, materialIndex: 0 },
+      { start: 6, count: 3, materialIndex: 1 },
+      { start: 12, count: 12, materialIndex: 2 },
+    ];
+    candidate.material[1].visible = false;
+    candidate.geometry.setDrawRange(0, 18);
+    harness.original.groups.set(
+      candidate,
+      candidate.geometry.groups.map((group) => ({ ...group })),
+    );
+    let renders = 0;
+    harness.renderer.onRender = () => {
+      renders++;
+      assert.deepEqual(candidate.geometry.groups, [
+        { start: 3, count: 3, materialIndex: 0 },
+        { start: 15, count: 3, materialIndex: 0 },
+      ]);
+    };
+    await harness.picker[method](PICK_POSITION, harness.candidates);
+    assert.equal(renders, 1);
+    assertSourceStateRestored(harness);
+    assert.equal(candidate.material[1].visible, false);
+    assert.deepEqual(candidate.geometry.drawRange, { start: 0, count: 18 });
+  });
+}
 
 test("all public pick methods forward the exact candidate map", async () => {
   const harness = createHarness();
