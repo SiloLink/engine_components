@@ -25,11 +25,6 @@ export interface OutlineGroupConfig {
   fillOpacity?: number;
   thickness?: number;
   /**
-   * Optionally render the selected geometry with its current source material
-   * in the base pass. This is independent of colored fill and outline styling.
-   */
-  surfaceMode?: "none" | "source-material";
-  /**
    * Higher priority groups win at coplanar pixels (z-fighting resolution
    * between groups). Default is 0. Use integer steps; a difference of 1 is
    * enough to resolve typical coplanar cases.
@@ -107,7 +102,6 @@ export class Outliner extends OBC.Component implements OBC.Disposable {
             fillColor: passGroup.fillColor.clone(),
             fillOpacity: passGroup.fillOpacity,
             thickness: passGroup.thickness,
-            surfaceMode: passGroup.surfaceMode,
             priority: passGroup.priority,
           };
         }
@@ -539,7 +533,6 @@ export class Outliner extends OBC.Component implements OBC.Disposable {
       fillColor: config.fillColor,
       fillOpacity: config.fillOpacity,
       thickness: config.thickness,
-      surfaceMode: config.surfaceMode,
       priority: config.priority,
     };
   }
@@ -553,7 +546,6 @@ export class Outliner extends OBC.Component implements OBC.Disposable {
       fillColor: update.fillColor?.clone() ?? current.fillColor?.clone(),
       fillOpacity: update.fillOpacity ?? current.fillOpacity,
       thickness: update.thickness ?? current.thickness,
-      surfaceMode: update.surfaceMode ?? current.surfaceMode,
       priority: update.priority ?? current.priority,
     };
   }
