@@ -140,13 +140,16 @@ export class GlossPass extends Pass {
     material.uniforms.glossBuffer.value = this.glossBuffer.texture;
     material.uniforms.sceneColorBuffer.value = readBuffer.texture;
 
-    // Render the final gloss effect
-    if (this.renderToScreen) {
-      renderer.setRenderTarget(null);
+    // Render the final gloss effect. It overwrites every pixel, so it must
+    // not clear the target first: that would also clear its depth texture,
+    // which can be the captured scene depth that later passes test against.
+    renderer.setRenderTarget(this.renderToScreen ? null : writeBuffer);
+    const previousAutoClear = renderer.autoClear;
+    renderer.autoClear = false;
+    try {
       this.fsQuad.render(renderer);
-    } else {
-      renderer.setRenderTarget(writeBuffer);
-      this.fsQuad.render(renderer);
+    } finally {
+      renderer.autoClear = previousAutoClear;
     }
 
     // Reset the depthBuffer value

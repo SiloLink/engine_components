@@ -284,7 +284,16 @@ export class EdgeDetectionPass extends Pass {
       renderer.setRenderTarget(writeBuffer);
     }
 
-    this._fsQuad.render(renderer);
+    // The composite overwrites every pixel. Clearing the target first would
+    // also clear its depth texture, which can be the captured scene depth
+    // that later passes, such as the outline fill, test against.
+    const previousAutoClear = renderer.autoClear;
+    renderer.autoClear = false;
+    try {
+      this._fsQuad.render(renderer);
+    } finally {
+      renderer.autoClear = previousAutoClear;
+    }
   }
 
   dispose() {
