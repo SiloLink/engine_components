@@ -4,6 +4,26 @@ import * as THREE from "three";
 import { FastModelPicker } from "../../../../dist/index.mjs";
 
 const PICK_POSITION = new THREE.Vector2(0.25, -0.5);
+const PICK_PASSES = [
+  {
+    name: "identity",
+    material: "idMaterial",
+    pick: (harness) =>
+      harness.picker.getModelAt(PICK_POSITION, harness.candidates),
+  },
+  {
+    name: "depth",
+    material: "depthMaterial",
+    pick: (harness) =>
+      harness.picker.getPointAtSync(PICK_POSITION, harness.candidates),
+  },
+  {
+    name: "normal",
+    material: "normalMaterial",
+    pick: (harness) =>
+      harness.picker.getNormalAt(PICK_POSITION, harness.candidates),
+  },
+];
 const CANDIDATE_RANGES = [
   { start: 3, count: 6 },
   { start: 15, count: 9 },
@@ -127,7 +147,7 @@ function createHarness({ candidateVisible = false } = {}) {
     debugMode: false,
     components: { get: () => fragments },
     world: {
-      renderer: { three: renderer },
+      renderer: { three: renderer, clippingPlanes: [] },
       scene: { three: scene },
       camera: { three: camera },
     },
@@ -179,6 +199,7 @@ function createHarness({ candidateVisible = false } = {}) {
   return {
     picker,
     renderer,
+    scene,
     fragments,
     candidates,
     candidate,
@@ -287,26 +308,7 @@ test("an empty candidate map is restrictive", async () => {
 });
 
 test("identity, depth, and normal passes render only candidate ranges", async () => {
-  for (const { name, material, pick } of [
-    {
-      name: "identity",
-      material: "idMaterial",
-      pick: (harness) =>
-        harness.picker.getModelAt(PICK_POSITION, harness.candidates),
-    },
-    {
-      name: "depth",
-      material: "depthMaterial",
-      pick: (harness) =>
-        harness.picker.getPointAtSync(PICK_POSITION, harness.candidates),
-    },
-    {
-      name: "normal",
-      material: "normalMaterial",
-      pick: (harness) =>
-        harness.picker.getNormalAt(PICK_POSITION, harness.candidates),
-    },
-  ]) {
+  for (const { name, material, pick } of PICK_PASSES) {
     const harness = createHarness({ candidateVisible: true });
     let renders = 0;
     harness.renderer.onRender = () => {
@@ -316,6 +318,66 @@ test("identity, depth, and normal passes render only candidate ranges", async ()
 
     await pick(harness);
     assert.equal(renders, 1, `${name} should render exactly once`);
+    assertSourceStateRestored(harness);
+  }
+});
+
+test("every pick pass clips like the tile material with global and local planes", async () => {
+  for (const { name, material, pick } of PICK_PASSES) {
+    const harness = createHarness({ candidateVisible: true });
+    const globalPlane = new THREE.Plane(new THREE.Vector3(1, 0, 0), 0);
+    const localPlane = new THREE.Plane(new THREE.Vector3(0, 1, 0), 0);
+    // The world renderer lists every active plane; only global ones also
+    // reach `renderer.three.clippingPlanes`.
+    harness.renderer.clippingPlanes = [globalPlane];
+    harness.picker.world.renderer.clippingPlanes = [globalPlane, localPlane];
+    for (const source of harness.candidate.material) {
+      source.clippingPlanes = harness.picker.world.renderer.clippingPlanes;
+      source.clipIntersection = true;
+    }
+    let renders = 0;
+    harness.renderer.onRender = () => {
+      renders += 1;
+      const pickMaterial = harness[material];
+      assert.deepEqual(pickMaterial.clippingPlanes, [globalPlane, localPlane]);
+      assert.equal(pickMaterial.clipping, true, name);
+      assert.equal(pickMaterial.clipIntersection, true, name);
+    };
+
+    await pick(harness);
+    assert.equal(renders, 1, `${name} should render exactly once`);
+    assertSourceStateRestored(harness);
+  }
+});
+
+test("every pick pass hides non-BIM lines, points, and sprites", async () => {
+  for (const { name, pick } of PICK_PASSES) {
+    const harness = createHarness({ candidateVisible: true });
+    const overlay = new THREE.Group();
+    const drawables = [
+      new THREE.Line(),
+      new THREE.LineSegments(),
+      new THREE.LineLoop(),
+      new THREE.Points(),
+      new THREE.Sprite(),
+    ];
+    const hidden = new THREE.LineSegments();
+    hidden.visible = false;
+    overlay.add(...drawables, hidden);
+    harness.scene.add(overlay);
+    let renders = 0;
+    harness.renderer.onRender = () => {
+      renders += 1;
+      assert.equal(overlay.visible, true);
+      for (const drawable of [...drawables, hidden]) {
+        assert.equal(drawable.visible, false, `${name} ${drawable.type}`);
+      }
+    };
+
+    await pick(harness);
+    assert.equal(renders, 1, `${name} should render exactly once`);
+    for (const drawable of drawables) assert.equal(drawable.visible, true);
+    assert.equal(hidden.visible, false);
     assertSourceStateRestored(harness);
   }
 });

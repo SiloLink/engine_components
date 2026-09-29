@@ -29,6 +29,39 @@ interface GeometryGroupSnapshot {
 }
 
 /**
+ * Fragment clipping of the pick shaders, with the semantics of three's
+ * `clipping_planes_fragment` chunk: the first `UNION_CLIPPING_PLANES` planes
+ * clip on their own, and the remaining ones (the local planes of a material
+ * with `clipIntersection`) clip only together.
+ */
+const CLIPPING_FRAGMENT = `
+  #if NUM_CLIPPING_PLANES > 0
+    for (int i = 0; i < UNION_CLIPPING_PLANES; i++) {
+      vec4 plane = clippingPlanes[i];
+      if (dot(vClipPosition, plane.xyz) > plane.w) discard;
+    }
+    #if UNION_CLIPPING_PLANES < NUM_CLIPPING_PLANES
+      bool clipped = true;
+      for (int i = UNION_CLIPPING_PLANES; i < NUM_CLIPPING_PLANES; i++) {
+        vec4 plane = clippingPlanes[i];
+        clipped = dot(vClipPosition, plane.xyz) > plane.w && clipped;
+      }
+      if (clipped) discard;
+    #endif
+  #endif
+`;
+
+/** Whether three draws the object itself rather than only its children. */
+function isDrawable(object: THREE.Object3D) {
+  return Boolean(
+    (object as THREE.Mesh).isMesh ||
+      (object as THREE.Line).isLine ||
+      (object as THREE.Points).isPoints ||
+      (object as THREE.Sprite).isSprite,
+  );
+}
+
+/**
  * GPU-readback picker that identifies what's under a screen position
  * without going through the worker raycast. Two granularities, same
  * render pass:
@@ -519,7 +552,7 @@ export class FastModelPicker implements Disposable {
     this._identityModelRoots.clear();
     this._pickTileCount = 0;
     this._pickVisibleTileCount = 0;
-    const planes = this.world.renderer!.three.clippingPlanes ?? [];
+    const planes = this.getClippingPlanes();
     let nextModelIndex = 1;
 
     for (const [modelId, model] of fragments.list) {
@@ -527,8 +560,6 @@ export class FastModelPicker implements Disposable {
       const modelCandidates = candidates?.get(modelId);
       if (candidates && !modelCandidates) continue;
       const idMaterial = this.getIdMaterial(nextModelIndex);
-      idMaterial.clippingPlanes = planes;
-      idMaterial.clipping = planes.length > 0;
       let hasOwnedMesh = false;
 
       for (const [, child] of model.tiles) {
@@ -553,6 +584,7 @@ export class FastModelPicker implements Disposable {
         if (child.visible) this._pickVisibleTileCount += 1;
         this._originalMaterials.set(child, child.material);
         const original = child.material;
+        if (!hasOwnedMesh) this.applyClipping(idMaterial, planes, original);
         let len = 1;
         if (!modelCandidates && Array.isArray(original)) len = original.length;
         child.material = this.getMaterialArray(idMaterial, len);
@@ -676,8 +708,8 @@ export class FastModelPicker implements Disposable {
   }
 
   /**
-   * Renders the BIM scene once through the cropped pick camera. Non-BIM meshes
-   * are hidden for the duration.
+   * Renders the BIM scene once through the cropped pick camera. Non-BIM
+   * drawables are hidden for the duration.
    */
   private renderPickPass(
     target: THREE.WebGLRenderTarget,
@@ -697,7 +729,7 @@ export class FastModelPicker implements Disposable {
     const prevBackground = (scene as THREE.Scene).background;
     const nonBimVisibility = new Map<THREE.Object3D, boolean>();
     try {
-      this.hideNonBimMeshes(
+      this.hideNonBimDrawables(
         scene,
         fragments,
         includedModelRoots,
@@ -735,7 +767,7 @@ export class FastModelPicker implements Disposable {
    * does; we also force each shell visible for the duration of the
    * render. The same cropped camera is shared with the identity pass.
    *
-   * Honours the renderer's clipping planes so picked depth/normal
+   * Honours the world's clipping planes so picked depth/normal
    * match what's actually rendered on screen.
    */
   private renderWithTileMaterial(
@@ -747,11 +779,8 @@ export class FastModelPicker implements Disposable {
     const scene = this.world.scene.three;
     const view = this.createPickView(ndc);
     const fragments = this.components.get(FragmentsManager);
-
-    // Sync clipping planes onto the swap material.
-    const planes = renderer.clippingPlanes ?? [];
-    material.clippingPlanes = planes;
-    material.clipping = planes.length > 0;
+    const planes = this.getClippingPlanes();
+    let clippingApplied = false;
 
     const prevTarget = renderer.getRenderTarget();
     const prevAutoClear = renderer.autoClear;
@@ -803,6 +832,10 @@ export class FastModelPicker implements Disposable {
 
           matSwap.set(child, child.material);
           const original = child.material;
+          if (!clippingApplied) {
+            this.applyClipping(material, planes, original);
+            clippingApplied = true;
+          }
           let len = 1;
           if (!modelCandidates && Array.isArray(original)) {
             len = original.length;
@@ -816,7 +849,7 @@ export class FastModelPicker implements Disposable {
         }
       }
 
-      this.hideNonBimMeshes(
+      this.hideNonBimDrawables(
         scene,
         fragments,
         includedModelRoots,
@@ -968,7 +1001,32 @@ export class FastModelPicker implements Disposable {
     snapshots.clear();
   }
 
-  private hideNonBimMeshes(
+  /**
+   * Planes that clip the rendered BIM geometry: the renderer's global planes
+   * and the world renderer's planes, which the Clipper assigns to each
+   * material in local clipping mode. As for the tile materials, three applies
+   * material planes only with `localClippingEnabled`.
+   */
+  private getClippingPlanes() {
+    const renderer = this.world.renderer!;
+    const planes = new Set(renderer.three.clippingPlanes ?? []);
+    for (const plane of renderer.clippingPlanes ?? []) planes.add(plane);
+    return Array.from(planes);
+  }
+
+  /** Clips a pick material like the tile material it replaces. */
+  private applyClipping(
+    material: THREE.ShaderMaterial,
+    planes: THREE.Plane[],
+    source: THREE.Material | THREE.Material[],
+  ) {
+    const reference = Array.isArray(source) ? source[0] : source;
+    material.clippingPlanes = planes;
+    material.clipping = planes.length > 0;
+    material.clipIntersection = reference?.clipIntersection ?? false;
+  }
+
+  private hideNonBimDrawables(
     scene: THREE.Object3D,
     fragments: FragmentsManager,
     includedModelRoots?: ReadonlySet<THREE.Object3D>,
@@ -986,7 +1044,7 @@ export class FastModelPicker implements Disposable {
     while (stack.length) {
       const node = stack.pop()!;
       if (modelRoots.has(node)) continue;
-      if (node !== scene && (node as THREE.Mesh).isMesh) {
+      if (node !== scene && isDrawable(node)) {
         this.setTemporaryVisibility(visibility, node, false);
       }
       for (const child of node.children) stack.push(child);
@@ -1072,12 +1130,7 @@ export class FastModelPicker implements Disposable {
           uniform vec4 clippingPlanes[NUM_CLIPPING_PLANES];
         #endif
         void main() {
-          #if NUM_CLIPPING_PLANES > 0
-            for (int i = 0; i < NUM_CLIPPING_PLANES; i++) {
-              vec4 plane = clippingPlanes[i];
-              if (dot(vClipPosition, plane.xyz) > plane.w) discard;
-            }
-          #endif
+          ${CLIPPING_FRAGMENT}
           outIdentity = vIdentity;
         }
       `,
@@ -1130,12 +1183,7 @@ export class FastModelPicker implements Disposable {
           uniform vec4 clippingPlanes[NUM_CLIPPING_PLANES];
         #endif
         void main() {
-          #if NUM_CLIPPING_PLANES > 0
-            for (int i = 0; i < NUM_CLIPPING_PLANES; i++) {
-              vec4 plane = clippingPlanes[i];
-              if (dot(vClipPosition, plane.xyz) > plane.w) discard;
-            }
-          #endif
+          ${CLIPPING_FRAGMENT}
           float v = gl_FragCoord.z;
           vec4 r = vec4(
             fract(v * 16777216.0),
@@ -1182,12 +1230,7 @@ export class FastModelPicker implements Disposable {
           uniform vec4 clippingPlanes[NUM_CLIPPING_PLANES];
         #endif
         void main() {
-          #if NUM_CLIPPING_PLANES > 0
-            for (int i = 0; i < NUM_CLIPPING_PLANES; i++) {
-              vec4 plane = clippingPlanes[i];
-              if (dot(vClipPosition, plane.xyz) > plane.w) discard;
-            }
-          #endif
+          ${CLIPPING_FRAGMENT}
           vec3 n = normalize(vWorldNormal);
           if (!gl_FrontFacing) n = -n;
           gl_FragColor = vec4(n * 0.5 + 0.5, 1.0);
