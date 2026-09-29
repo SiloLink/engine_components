@@ -874,13 +874,17 @@ export class Outliner extends OBC.Component implements OBC.Disposable {
       this.refreshAttachedModel(modelId);
     };
     model.tiles.onItemSet.add(refresh);
+    model.tiles.onItemUpdated.add(refresh);
     model.tiles.onItemDeleted.add(refresh);
+    model.tiles.onCleared.add(refresh);
     model.onViewUpdated.add(refreshAttached);
     this._tileListeners.set(modelId, {
       model,
       unbind: () => {
         model.tiles.onItemSet.remove(refresh);
+        model.tiles.onItemUpdated.remove(refresh);
         model.tiles.onItemDeleted.remove(refresh);
+        model.tiles.onCleared.remove(refresh);
         model.onViewUpdated.remove(refreshAttached);
       },
     });
@@ -891,18 +895,43 @@ export class Outliner extends OBC.Component implements OBC.Disposable {
     const models = this.components.get(OBC.FragmentsManager).list;
     const onSet = ({ key }: { key: string }) => this.refreshModel(key);
     const onDeleted = (key: string) => this.refreshModel(key);
+    const onCleared = () => {
+      for (const modelId of [...this._tileListeners.keys()]) {
+        this.refreshModel(modelId);
+      }
+    };
     models.onItemSet.add(onSet);
     models.onItemUpdated.add(onSet);
     models.onItemDeleted.add(onDeleted);
+    models.onCleared.add(onCleared);
     this._modelEventsUnbind = () => {
       models.onItemSet.remove(onSet);
       models.onItemUpdated.remove(onSet);
       models.onItemDeleted.remove(onDeleted);
+      models.onCleared.remove(onCleared);
     };
   }
 
   private refreshModel(modelId: string) {
     this.bindModelTileEvents(modelId);
+    // Fragments releases retired tile buffers synchronously. Detach their mask
+    // proxies and pick ranges before any asynchronous replacement chunk query:
+    // uploaded attributes may no longer retain CPU arrays for another render.
+    const model = this.components.get(OBC.FragmentsManager).list.get(modelId);
+    const liveTiles = new Set(model?.tiles.values());
+    for (const [groupName, state] of this._groups) {
+      const attached = state.attached.get(modelId);
+      const resolved = state.resolved.get(modelId);
+      if (!attached) continue;
+      for (const tile of attached) {
+        if (liveTiles.has(tile)) continue;
+        this._outlinePass?.detachOutlinedTile(tile, groupName);
+        attached.delete(tile);
+        resolved?.delete(tile);
+      }
+      if (attached.size === 0) state.attached.delete(modelId);
+      if (resolved?.size === 0) state.resolved.delete(modelId);
+    }
     for (const [groupName, state] of this._groups) {
       const localIds = state.map[modelId];
       if (localIds && localIds.size > 0) {
