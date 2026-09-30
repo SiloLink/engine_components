@@ -12,11 +12,8 @@ export default defineConfig({
     },
     rollupOptions: {
       external: (id) => {
-        const shared = [
-          ...Object.keys(packageJson.peerDependencies),
-          "@thatopen/components",
-        ];
-        return shared.some((p) => id === p || id.startsWith(`${p}/`));
+        const peers = Object.keys(packageJson.peerDependencies);
+        return peers.some((p) => id === p || id.startsWith(`${p}/`));
       },
       output: [
         {
