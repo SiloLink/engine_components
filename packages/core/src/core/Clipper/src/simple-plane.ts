@@ -120,7 +120,11 @@ export class SimplePlane implements Disposable, Hideable {
     // `undefined` on every re-enable and the plane would silently
     // pop back into the renderer's global clipping list.
     const clipper = this.components.get(Clipper);
-    this.world.renderer.setPlane(state, this.three, clipper.localClippingPlanes);
+    this.world.renderer.setPlane(
+      state,
+      this.three,
+      clipper.localClippingPlanes,
+    );
     this.notifyManager();
   }
 
@@ -253,13 +257,7 @@ export class SimplePlane implements Disposable, Hideable {
    */
   setFromNormalAndCoplanarPoint(normal: THREE.Vector3, point: THREE.Vector3) {
     this.reset();
-    if (!this.normal.equals(normal)) {
-      this.normal.copy(normal);
-      this._helper.lookAt(normal);
-    }
-    this.origin.copy(point);
-    this._helper.position.copy(point);
-    this._helper.updateMatrix();
+    this.placeHelper(normal, point);
     this.update();
   }
 
@@ -317,14 +315,22 @@ export class SimplePlane implements Disposable, Hideable {
   }
 
   private reset() {
-    const normal = new THREE.Vector3(1, 0, 0);
-    const point = new THREE.Vector3();
-    if (!this.normal.equals(normal)) {
-      this.normal.copy(normal);
-      this._helper.lookAt(normal);
-    }
+    this.placeHelper(new THREE.Vector3(1, 0, 0), new THREE.Vector3());
+  }
+
+  /**
+   * Moves the helper to the plane origin and faces it along the normal.
+   * `lookAt` targets a world point, so the direction is taken from the
+   * helper's new position; otherwise a helper away from the origin would tilt
+   * toward the point `normal` whenever the normal changes.
+   */
+  private placeHelper(normal: THREE.Vector3, point: THREE.Vector3) {
     this.origin.copy(point);
     this._helper.position.copy(point);
+    if (!this.normal.equals(normal)) {
+      this.normal.copy(normal);
+      this._helper.lookAt(point.clone().add(normal));
+    }
     this._helper.updateMatrix();
   }
 
@@ -389,8 +395,8 @@ export class SimplePlane implements Disposable, Hideable {
 
   private newHelper() {
     const helper = new THREE.Object3D();
-    helper.lookAt(this.normal);
     helper.position.copy(this.origin);
+    helper.lookAt(this.origin.clone().add(this.normal));
     this._planeMesh.position.z += 0.01;
     helper.add(this._planeMesh);
     this.world.scene.three.add(helper);
