@@ -61,6 +61,12 @@ export class SimplePlane implements Disposable, Hideable {
 
   private readonly _arrowBoundBox = new THREE.Mesh();
 
+  /** Distance from the plane to each arrow of its handle, in gizmo units. */
+  private static readonly axisReach = 0.15;
+
+  /** Length of the stock translate arrow head, in gizmo units. */
+  private static readonly arrowLength = 0.1;
+
   private readonly _planeMesh: THREE.Mesh;
 
   private readonly _controls: TransformControls;
@@ -365,6 +371,78 @@ export class SimplePlane implements Disposable, Hideable {
     controls.setSpace("local");
     this.createArrowBoundingBox();
     controls.getHelper().children[0].children[0].add(this._arrowBoundBox);
+    this.shapeAxis(controls);
+  }
+
+  /**
+   * Shapes the plane's single visible axis: the stock translate gizmo draws
+   * its shaft only from the center to the positive arrow and reaches half a
+   * unit each way. A clipping plane moves both ways and sits on geometry, so
+   * its axis carries a shaft spanning both arrows at half the stock reach,
+   * with the same line thickness; the pickers follow the arrows. The gizmo
+   * bakes placement into geometry and resets object transforms on every
+   * update, so geometries are replaced rather than meshes transformed. The
+   * shared stock geometries and the other axes are left untouched.
+   */
+  private shapeAxis(controls: TransformControls) {
+    const root = controls.getHelper().children[0] as unknown as {
+      gizmo?: { translate?: THREE.Object3D };
+      picker?: { translate?: THREE.Object3D };
+    };
+    const half = SimplePlane.axisReach;
+    const alongZ = (geometry: THREE.BufferGeometry, sign: number) =>
+      geometry.rotateX((sign * Math.PI) / 2);
+    const signOf = (mesh: THREE.Mesh) => {
+      mesh.geometry.computeBoundingBox();
+      const box = mesh.geometry.boundingBox!;
+      return box.min.z + box.max.z >= 0 ? 1 : -1;
+    };
+    for (const child of root.gizmo?.translate?.children ?? []) {
+      // Duck-type: a consumer may resolve a second three module instance.
+      if (child.name !== "Z" || !(child as THREE.Mesh).isMesh) continue;
+      const mesh = child as THREE.Mesh;
+      const parameters = (mesh.geometry as THREE.CylinderGeometry).parameters;
+      if (!parameters) continue;
+      if (parameters.radiusTop === parameters.radiusBottom) {
+        mesh.geometry = alongZ(
+          new THREE.CylinderGeometry(
+            parameters.radiusTop,
+            parameters.radiusBottom,
+            half * 2,
+            parameters.radialSegments,
+          ),
+          1,
+        );
+      } else {
+        const sign = signOf(mesh);
+        mesh.geometry = alongZ(
+          new THREE.CylinderGeometry(
+            parameters.radiusTop,
+            parameters.radiusBottom,
+            parameters.height,
+            parameters.radialSegments,
+          ).translate(0, half + parameters.height / 2, 0),
+          sign,
+        );
+      }
+    }
+    for (const child of root.picker?.translate?.children ?? []) {
+      if (child.name !== "Z" || !(child as THREE.Mesh).isMesh) continue;
+      const mesh = child as THREE.Mesh;
+      const parameters = (mesh.geometry as THREE.CylinderGeometry).parameters;
+      if (!parameters) continue;
+      const sign = signOf(mesh);
+      const reach = half + SimplePlane.arrowLength;
+      mesh.geometry = alongZ(
+        new THREE.CylinderGeometry(
+          parameters.radiusTop,
+          parameters.radiusBottom,
+          reach,
+          parameters.radialSegments,
+        ).translate(0, reach / 2, 0),
+        sign,
+      );
+    }
   }
 
   private createArrowBoundingBox() {
