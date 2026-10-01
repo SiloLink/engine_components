@@ -332,9 +332,13 @@ export class SimpleOutlinePass extends Pass {
     const id = this.allocateId();
     const priority = config?.priority ?? 0;
 
+    // The mask follows the world's clipping planes so outlined items end at
+    // a section cut like their source geometry. The renderer's list is
+    // edited in place, so the material always sees the current planes.
     const material = new THREE.ShaderMaterial({
       uniforms: { idColor: { value: new THREE.Vector4(id / 255, 0, 0, 1) } },
       clipping: true,
+      clippingPlanes: this._world.renderer?.clippingPlanes ?? null,
       vertexShader: GHOST_VERT,
       fragmentShader: GHOST_FRAG,
       depthTest: true,

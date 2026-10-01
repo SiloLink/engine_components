@@ -87,8 +87,12 @@ export class EdgeDetectionPass extends Pass {
 
     // Create override material with depth bias based on vertex colors
     // Higher vertex colors will render on top (closer to camera)
+    // The face-ID raster follows the renderer's clipping planes, so edges
+    // stop at a section cut like the geometry they are detected on. The
+    // renderer's list is edited in place; the material sees the current planes.
     this._overrideMaterial = new THREE.ShaderMaterial({
       clipping: true,
+      clippingPlanes: renderer.clippingPlanes,
       side: THREE.DoubleSide,
       uniforms: {
         depthBiasStrength: { value: this._depthBiasStrength },
