@@ -278,9 +278,10 @@ export class SimplePlane implements Disposable, Hideable {
   };
 
   private updateScale = () => {
-    if (!this.autoScale) return;
     const camera = this.world.camera?.three;
     if (!camera) return;
+    this.followCamera(camera);
+    if (!this.autoScale) return;
     if (!(camera instanceof THREE.PerspectiveCamera)) return;
     const cameraPosition = new THREE.Vector3();
     camera.getWorldPosition(cameraPosition);
@@ -288,6 +289,17 @@ export class SimplePlane implements Disposable, Hideable {
     const scale = (distance / 7) * this._sizeMultiplier;
     this._planeMesh.scale.set(scale, scale, scale);
   };
+
+  /**
+   * The world may swap its camera object, as the ortho/perspective camera
+   * does on a projection change. The controls size, orient and pick their
+   * handles with their own camera, so they follow the world's current one.
+   */
+  private followCamera(camera: THREE.Camera) {
+    if (this._controls.camera !== camera) {
+      this._controls.camera = camera;
+    }
+  }
 
   /** {@link Disposable.dispose} */
   dispose() {
