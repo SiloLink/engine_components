@@ -24,10 +24,7 @@ import {
 import { MeasureVolume } from "../../utils/measure-volume";
 
 export { MeasurementPickMode } from "./src";
-export type {
-  MeasurementStateChange,
-  MeasureToUnitMap,
-} from "./src";
+export type { MeasurementStateChange, MeasureToUnitMap } from "./src";
 
 /**
  * How measurement lines are rendered.
@@ -72,6 +69,10 @@ export abstract class Measurement<
 
   delay = 300;
 
+  /** Host applications can own scoped keyboard shortcuts. */
+  keyboardEnabled = true;
+  private _previewGeneration = 0;
+
   /**
    * When to run the snap pick that drives the preview marker. See
    * {@link MeasurementPickMode}. Defaults to `MOUSE_MOVE` (pick on
@@ -98,6 +99,8 @@ export abstract class Measurement<
   };
 
   set world(value: OBC.World | null) {
+    this._previewGeneration += 1;
+    this.lastPick = null;
     if (this._world?.renderer) {
       this._world.renderer.onResize.remove(this._onWorldResize);
     }
@@ -209,30 +212,39 @@ export abstract class Measurement<
       // doesn't see a stale snap floating along with the cursor; it
       // pops back in once the cursor settles and the pick resolves.
       this._vertexPicker.marker.visible = false;
-      this._world?.renderer?.update();
+      this.requestRender();
     }
   };
 
   private scheduleMarkerUpdate() {
     if (this._markerRafScheduled) return;
     this._markerRafScheduled = true;
+    const generation = this._previewGeneration;
     requestAnimationFrame(async () => {
       try {
-        if (!this.enabled) return;
+        if (!this.enabled || generation !== this._previewGeneration) return;
         // Skip picks while the user is dragging the camera — they're
         // moving the world, not aiming at a snap target. The pick
         // would also waste GPU readback while the renderer is busy
         // re-drawing for camera motion.
         if (this._cameraInteracting) return;
         try {
-          this.lastPick = await this._vertexPicker.get({
+          const pick = await this._vertexPicker.get({
             snappingClasses: this.snappings,
           });
+          if (!this.enabled || generation !== this._previewGeneration) {
+            if (this._vertexPicker.marker)
+              this._vertexPicker.marker.visible = false;
+            this.requestRender();
+            return;
+          }
+          this.lastPick = pick;
         } catch {
           // Picker errors are non-fatal; a transient world /
           // fragments race shouldn't bubble.
           this.lastPick = null;
         }
+        if (!this.enabled || generation !== this._previewGeneration) return;
         // Marker position was updated by `_vertexPicker.get`; that
         // changes the underlying THREE node, but the visual painter
         // (CSS2D-style render in `world.renderer`) only fires when
@@ -246,8 +258,8 @@ export abstract class Measurement<
         // pointer move nothing else is ticking the renderer, so
         // without this call the marker visually freezes until the
         // user stops the cursor.
-        this._world?.renderer?.update();
         this.onPointerMove.trigger();
+        this.requestRender();
       } finally {
         // Released last so a new pick can't kick off until this one
         // finishes — picks are bursty, and we'd otherwise queue
@@ -258,8 +270,15 @@ export abstract class Measurement<
     });
   }
 
+  private requestRender(): void {
+    const renderer = this._world?.renderer;
+    if (!renderer) return;
+    if ("needsUpdate" in renderer) renderer.needsUpdate = true;
+    renderer.update();
+  }
+
   private onKeydown = (e: KeyboardEvent) => {
-    if (!(this.enabled && e.key === "Escape")) return;
+    if (!(this.keyboardEnabled && this.enabled && e.key === "Escape")) return;
     this.cancelCreation();
   };
 
@@ -324,7 +343,7 @@ export abstract class Measurement<
           this._vertexPicker.marker.visible = false;
         }
         // Repaint so the hidden marker actually disappears.
-        this._world?.renderer?.update();
+        this.requestRender();
       };
       viewerContainer.addEventListener(
         "pointerleave",
@@ -340,6 +359,8 @@ export abstract class Measurement<
       if (controls) {
         this._onCtrlStart = () => {
           this._cameraInteracting = true;
+          this._previewGeneration += 1;
+          this.lastPick = null;
           hideMarker();
         };
         this._onCtrlEnd = () => {
@@ -355,6 +376,8 @@ export abstract class Measurement<
       // we resume picks.
       this._onWheel = () => {
         this._cameraInteracting = true;
+        this._previewGeneration += 1;
+        this.lastPick = null;
         hideMarker();
         if (this._wheelIdleTimer !== null) clearTimeout(this._wheelIdleTimer);
         if (this.cameraStopDelay <= 0) {
@@ -377,6 +400,8 @@ export abstract class Measurement<
 
   private _enabled = false;
   set enabled(value: boolean) {
+    this._previewGeneration += 1;
+    this.lastPick = null;
     this._enabled = value;
     this._vertexPicker.enabled = value;
     this.setEvents(value);
@@ -669,6 +694,7 @@ export abstract class Measurement<
   delete = (_data?: any) => {};
 
   dispose() {
+    this._previewGeneration += 1;
     this._vertexPicker.dispose();
     this.list.clear();
     this._basicLinesMaterial.dispose();

@@ -112,6 +112,22 @@ export class MeasureVolume {
   world: OBC.World;
   volume: Volume;
   meshes: THREE.Mesh[] = [];
+  private _disposed = false;
+  private _revision = 0;
+  private _tail: Promise<void> = Promise.resolve();
+  private _pending = new Set<Promise<void>>();
+  private _failure: { cause: unknown } | undefined;
+  private _onItemsChanged = () => {
+    this.update().catch(() => undefined);
+  };
+
+  /** Includes constructor and item-change work, including a retired visual. */
+  async whenSettled(): Promise<void> {
+    while (this._pending.size) await Promise.allSettled([...this._pending]);
+    const failure = this._failure;
+    this._failure = undefined;
+    if (failure) throw failure.cause;
+  }
 
   constructor(
     components: OBC.Components,
@@ -123,8 +139,8 @@ export class MeasureVolume {
     this.volume = volume;
     this.label = new MeasureMark(world);
     this.visible = true;
-    this.update();
-    this.volume.onItemsChanged.add(() => this.update());
+    this._onItemsChanged();
+    this.volume.onItemsChanged.add(this._onItemsChanged);
   }
 
   applyPlanesVisibility(planes: THREE.Plane[]) {
@@ -141,7 +157,7 @@ export class MeasureVolume {
     }
   }
 
-  private async updateMesh() {
+  private async updateMesh(revision: number) {
     this.cleanMeshes();
     const fragments = this._components.get(OBC.FragmentsManager);
     if (!fragments.initialized) return;
@@ -150,20 +166,17 @@ export class MeasureVolume {
       const model = fragments.list.get(modelId);
       if (!model) continue;
       if (!localIds || (localIds as Set<number>).size === 0) continue;
-      let chunks: ItemDrawChunks[];
-      try {
-        chunks = (await (model as any).getItemDrawChunks(
-          localIds,
-        )) as ItemDrawChunks[];
-      } catch {
-        continue;
-      }
+      const chunks = (await (model as any).getItemDrawChunks(
+        localIds,
+      )) as ItemDrawChunks[];
+      if (this._disposed || revision !== this._revision) return;
+      if (fragments.list.get(modelId) !== model) continue;
       if (!chunks || chunks.length === 0) continue;
       for (const entry of chunks) {
         const tile = model.tiles.get(entry.tileId);
         if (!tile) continue;
         const proxy = this.buildProxy(tile, entry.position, entry.size);
-        this.world.scene.three.add(proxy);
+        if (this.visible) this.world.scene.three.add(proxy);
         this.meshes.push(proxy);
       }
     }
@@ -211,13 +224,37 @@ export class MeasureVolume {
     return proxy;
   }
 
-  async update() {
-    await this.updateMesh();
-    const value = await this.volume.getRawValue();
-    this.label.visible = value !== 0;
-    this.label.value = value;
-    const center = await this.volume.getCenter();
-    if (center) this.label.three.position.copy(center);
+  update(): Promise<void> {
+    if (this._disposed) return Promise.resolve();
+    const revision = ++this._revision;
+    const task = this._tail.then(async () => {
+      if (this._disposed || revision !== this._revision) return;
+      await this.updateMesh(revision);
+      if (this._disposed || revision !== this._revision) return;
+      const value = await this.volume.getRawValue();
+      if (this._disposed || revision !== this._revision) return;
+      const center = await this.volume.getCenter();
+      if (this._disposed || revision !== this._revision) return;
+      this.label.visible = this.visible && value !== 0;
+      this.label.value = value;
+      if (center) this.label.three.position.copy(center);
+      if (this.world.renderer) {
+        if ("needsUpdate" in this.world.renderer)
+          this.world.renderer.needsUpdate = true;
+        this.world.renderer.update();
+      }
+    });
+    this._pending.add(task);
+    this._tail = task.then(
+      () => {
+        this._pending.delete(task);
+      },
+      (cause) => {
+        this._pending.delete(task);
+        this._failure = { cause };
+      },
+    );
+    return task;
   }
 
   private cleanMeshes() {
@@ -233,6 +270,10 @@ export class MeasureVolume {
   }
 
   dispose() {
+    if (this._disposed) return;
+    this._disposed = true;
+    this._revision += 1;
+    this.volume.onItemsChanged.remove(this._onItemsChanged);
     this.label.dispose();
     this.cleanMeshes();
     this._material.dispose();

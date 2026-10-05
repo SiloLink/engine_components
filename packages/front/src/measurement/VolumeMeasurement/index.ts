@@ -12,6 +12,29 @@ export class VolumeMeasurement extends Measurement<Volume, "volume"> {
   static uuid = "01f885ab-ec4e-4e6c-a853-9dfc0d6766ed" as const;
 
   private _temp: VolumeMeasurerTempData = {};
+  private _visuals = new Set<MeasureVolume>();
+  private _creationGeneration = 0;
+
+  /** Await preview, committed, and retired overlay work; propagate native failures. */
+  async whenSettled(): Promise<void> {
+    const visuals = [...this._visuals];
+    const results = await Promise.allSettled(
+      visuals.map((visual) => visual.whenSettled()),
+    );
+    for (const visual of visuals) {
+      if (!this.volumes.has(visual) && this._temp.preview !== visual)
+        this._visuals.delete(visual);
+    }
+    const failure = results.find(
+      (result): result is PromiseRejectedResult => result.status === "rejected",
+    );
+    if (failure) throw failure.reason;
+  }
+
+  override dispose(): void {
+    this.cancelCreation();
+    super.dispose();
+  }
 
   readonly onPreviewInitialized = new OBC.Event<MeasureVolume>();
 
@@ -52,6 +75,7 @@ export class VolumeMeasurement extends Measurement<Volume, "volume"> {
   private initHandlers() {
     this.list.onItemAdded.add((volume) => {
       const element = this.createVolumeElement(volume);
+      this._visuals.add(element);
       element.color = this.color;
       element.rounding = this.rounding;
       element.units = this.units;
@@ -106,6 +130,7 @@ export class VolumeMeasurement extends Measurement<Volume, "volume"> {
     }
 
     this._temp.preview = new MeasureVolume(this.components, this.world);
+    this._visuals.add(this._temp.preview);
     this._temp.preview.color = this.color;
     this._temp.preview.rounding = this.rounding;
     this._temp.preview.units = this.units;
@@ -115,13 +140,21 @@ export class VolumeMeasurement extends Measurement<Volume, "volume"> {
   create = async () => {
     if (!this.enabled) return;
 
+    const generation = this._creationGeneration;
     const pickResult = (await this._vertexPicker.get()) as any;
+    if (!this.enabled || generation !== this._creationGeneration) return;
     if (!pickResult) return;
 
     if (!this._temp.preview) {
       await this.initPreview();
     }
 
+    if (
+      !this.enabled ||
+      generation !== this._creationGeneration ||
+      !this._temp.preview
+    )
+      return;
     this._temp.preview!.volume.items = OBC.ModelIdMapUtils.join([
       this._temp.preview!.volume.items,
       {
@@ -140,6 +173,7 @@ export class VolumeMeasurement extends Measurement<Volume, "volume"> {
   };
 
   cancelCreation = () => {
+    this._creationGeneration += 1;
     this._temp.preview?.dispose();
     delete this._temp.preview;
   };

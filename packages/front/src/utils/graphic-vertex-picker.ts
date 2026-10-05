@@ -26,8 +26,11 @@ export class GraphicVertexPicker implements OBC.Disposable {
   marker: Mark | null = null;
 
   private _world: OBC.World | null = null;
+  private _generation = 0;
+  private _disposed = false;
   set world(value: OBC.World | null) {
     if (value === this._world) return;
+    this._generation += 1;
     this.detachCursorTracking();
     this._world = value;
     if (value) this.attachCursorTracking();
@@ -69,10 +72,11 @@ export class GraphicVertexPicker implements OBC.Disposable {
 
   private _enabled = false;
   set enabled(value: boolean) {
+    this._generation += 1;
     this._enabled = value;
     if (this.marker) this.marker.visible = value;
     if (value) {
-      this.get();
+      this.get().catch(() => undefined);
     }
   }
 
@@ -115,6 +119,8 @@ export class GraphicVertexPicker implements OBC.Disposable {
 
   /** {@link OBC.Disposable.onDisposed} */
   dispose() {
+    this._disposed = true;
+    this._generation += 1;
     this.detachCursorTracking();
     if (this.marker) {
       this.marker.dispose();
@@ -133,6 +139,8 @@ export class GraphicVertexPicker implements OBC.Disposable {
     world?: OBC.World;
     snappingClasses?: FRAGS.SnappingClass[];
   }) {
+    if (this._disposed) return null;
+    const generation = this._generation;
     const world = config?.world ?? this.world;
     if (!world) {
       throw new Error(
@@ -145,6 +153,8 @@ export class GraphicVertexPicker implements OBC.Disposable {
     const intersects = await caster.castRay({
       snappingClasses: config?.snappingClasses,
     });
+
+    if (this._disposed || generation !== this._generation) return null;
 
     if (intersects) {
       if (!this.marker) {
@@ -296,9 +306,7 @@ export class GraphicVertexPicker implements OBC.Disposable {
   private syncMarkerToCursor() {
     if (!this.marker || !this._world?.camera) return;
     const camera = this._world.camera.three;
-    this._ndcWorld
-      .set(this._lastNdc.x, this._lastNdc.y, 0.5)
-      .unproject(camera);
+    this._ndcWorld.set(this._lastNdc.x, this._lastNdc.y, 0.5).unproject(camera);
     this.marker.three.position.copy(this._ndcWorld);
   }
 }
