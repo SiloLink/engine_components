@@ -28,21 +28,24 @@ test("edge detection renders face IDs with the renderer's clipping planes", () =
   pass.dispose();
 });
 
-test("outline masks render with the world's clipping planes", () => {
+test("outline masks and fills render with the world's clipping planes", () => {
   const renderer = createRenderer();
   const world = {
     renderer,
     scene: { three: new THREE.Scene() },
     camera: { three: new THREE.PerspectiveCamera() },
   };
-  const pass = new SimpleOutlinePass(8, 8, world as any, () => null, false);
+  const pass = new SimpleOutlinePass(8, 8, world as any, false);
   pass.addGroup("selection");
-  const material = pass.getGroup("selection")!.material;
+  const { material, fillMaterial } = pass.getGroup("selection")!;
   assert.equal(material.clipping, true);
-  assert.equal(material.clippingPlanes, renderer.clippingPlanes);
+  for (const outline of [material, fillMaterial]) {
+    assert.equal(outline.clippingPlanes, renderer.clippingPlanes);
+  }
 
   const plane = new THREE.Plane(new THREE.Vector3(1, 0, 0), -3);
   renderer.clippingPlanes.push(plane);
   assert.deepEqual(material.clippingPlanes, [plane]);
+  assert.deepEqual(fillMaterial.clippingPlanes, [plane]);
   pass.dispose();
 });

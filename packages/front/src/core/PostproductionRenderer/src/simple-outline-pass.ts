@@ -8,6 +8,13 @@ import {
 const PALETTE_SIZE = 256;
 const DEFAULT_GROUP = "default";
 
+/**
+ * Fill twins of meshes added through `addMeshToGroup` have no surface of
+ * their own in the scene render, so they draw as its first translucent
+ * surfaces, after every opaque one.
+ */
+const MESH_FILL_GROUP_ORDER = -1_000_000;
+
 interface DrawRange {
   start: number;
   count: number;
@@ -20,6 +27,8 @@ interface OutlineGroup {
   container: THREE.Group;
   /** Dedicated material for this group, with its idColor uniform baked in. */
   material: THREE.ShaderMaterial;
+  /** Translucent fill drawn on outlined geometry inside the scene render. */
+  fillMaterial: THREE.MeshBasicMaterial;
   outlineColor: THREE.Color;
   fillColor: THREE.Color;
   fillOpacity: number;
@@ -30,6 +39,10 @@ interface OutlineGroup {
    */
   priority: number;
 }
+
+type OutlineGroupConfig = Partial<
+  Omit<OutlineGroup, "id" | "name" | "container" | "material" | "fillMaterial">
+>;
 
 /**
  * A proxy mesh attached to the pass via {@link SimpleOutlinePass.attachOutlinedTile}.
@@ -49,6 +62,21 @@ interface OutlinedTileProxy {
   proxy: THREE.Mesh;
   ranges: DrawRange[];
   groupName: string;
+}
+
+type RenderHook = THREE.Object3D["onAfterRender"];
+
+/** Outlined tiles of one source mesh and the render hook that fills them. */
+interface TileFill {
+  tile: THREE.Mesh;
+  targets: Set<OutlinedTileProxy>;
+  /** Fills for the current scene render, highest group priority first. */
+  fills: { ranges: DrawRange[]; material: THREE.MeshBasicMaterial }[];
+  /** Installed on the tile only while a scene render fills it. */
+  hook: RenderHook;
+  installed: boolean;
+  /** The tile's own hook while ours is installed, undefined for the prototype's. */
+  previous: RenderHook | undefined;
 }
 
 const GHOST_VERT = `
@@ -78,10 +106,17 @@ const GHOST_FRAG = `
  * the group's container; all ghosts across all groups are then rendered into
  * the mask target in one `renderer.render(rootScene, camera)` call.
  *
- * A composite shader reads the mask (center pixel id), applies that group's
- * fill only where the selected depth matches the rendered scene, then samples
- * the x-ray mask neighborhood within the group's thickness to paint an inward
- * outline wherever the center is near a different id.
+ * A composite shader reads the mask (center pixel id) and samples the x-ray
+ * mask neighborhood within the group's thickness to paint an inward outline
+ * wherever the center is near a different id.
+ *
+ * Fills are drawn by the scene render itself (see {@link showSceneFills}):
+ * right after three.js draws a range of a filled tile, a render hook paints
+ * the outlined part of that range. A fill is therefore exactly as visible as its
+ * surface. Surfaces drawn later blend over it or hide it like they do the
+ * surface, whether the outlined surface is opaque or itself translucent.
+ * Styles without a color render overlay the fill in the composite instead
+ * ({@link compositeFill}).
  *
  * Legacy single-outline API (`outlineColor`, `thickness`, `fillColor`,
  * `fillOpacity`, `scene`) is preserved as a delegate to the "default" group.
@@ -89,14 +124,31 @@ const GHOST_FRAG = `
 export class SimpleOutlinePass extends Pass {
   debugShowMask = false;
 
+  /**
+   * Whether the composite paints group fills over the finished image.
+   * Postproduction turns this off when its base pass draws the fills inside
+   * the scene render.
+   */
+  compositeFill = true;
+
   private _world: OBC.World;
-  private _getSceneDepthTexture: () => THREE.DepthTexture | null;
   private _maskTarget: THREE.WebGLRenderTarget;
-  private _compositeTarget: THREE.WebGLRenderTarget | null = null;
   private _rootScene: THREE.Scene;
   private _fsQuad: FullScreenQuad;
-  private _copyQuad: FullScreenQuad;
   private _debugQuad: FullScreenQuad;
+  private _tileFills = new Map<THREE.Mesh, TileFill>();
+  private readonly _filledStarts: number[] = [];
+  private readonly _filledEnds: number[] = [];
+  private readonly _fillRange: THREE.GeometryGroup = {
+    start: 0,
+    count: 0,
+    materialIndex: 0,
+  };
+  /** Fill twins of meshes added through {@link addMeshToGroup}. */
+  private _sceneFills = new THREE.Group();
+  private _meshFills = new Map<THREE.Mesh, THREE.Mesh>();
+  /** Polygon offset units that move a fill towards the camera. */
+  private _fillOffsetUnits: number;
 
   private _groups = new Map<string, OutlineGroup>();
   private _groupsById = new Map<number, OutlineGroup>();
@@ -117,23 +169,27 @@ export class SimpleOutlinePass extends Pass {
     width: number,
     height: number,
     world: OBC.World,
-    getSceneDepthTexture: () => THREE.DepthTexture | null,
     reversedDepth: boolean,
   ) {
     super();
     this._world = world;
-    this._getSceneDepthTexture = getSceneDepthTexture;
+    // three.js negates the offset factor for a reversed depth buffer, but
+    // not the units.
+    this._fillOffsetUnits = reversedDepth ? 1 : -1;
 
-    const selectedDepthTexture = new THREE.DepthTexture(width, height);
-    if (reversedDepth) selectedDepthTexture.type = THREE.FloatType;
     this._maskTarget = new THREE.WebGLRenderTarget(width, height, {
       minFilter: THREE.NearestFilter,
       magFilter: THREE.NearestFilter,
       format: THREE.RGBAFormat,
       type: THREE.UnsignedByteType,
       depthBuffer: true,
-      depthTexture: selectedDepthTexture,
     });
+
+    this._sceneFills.name = "outline-scene-fills";
+    this._sceneFills.renderOrder = MESH_FILL_GROUP_ORDER;
+    this._sceneFills.visible = false;
+    this._sceneFills.matrixAutoUpdate = false;
+    this._sceneFills.matrixWorldAutoUpdate = false;
 
     this._rootScene = new THREE.Scene();
     this._rootScene.background = null;
@@ -157,13 +213,10 @@ export class SimpleOutlinePass extends Pass {
         uniforms: {
           tDiffuse: { value: null },
           tMask: { value: null },
-          tSelectedDepth: { value: null },
-          tSceneDepth: { value: null },
           tPalette: { value: this._paletteTexture },
           resolution: { value: new THREE.Vector2(width, height) },
           maxThickness: { value: this._maxThickness },
-          hasSceneDepth: { value: false },
-          reversedDepth: { value: false },
+          compositeFill: { value: true },
         },
         vertexShader: `
           varying vec2 vUv;
@@ -178,13 +231,10 @@ export class SimpleOutlinePass extends Pass {
 
           uniform sampler2D tDiffuse;
           uniform sampler2D tMask;
-          uniform sampler2D tSelectedDepth;
-          uniform sampler2D tSceneDepth;
           uniform sampler2D tPalette;
           uniform vec2 resolution;
           uniform float maxThickness;
-          uniform bool hasSceneDepth;
-          uniform bool reversedDepth;
+          uniform bool compositeFill;
 
           // Palette is 256x2. y=0.25 (row 0) line, y=0.75 (row 1) fill.
           vec4 paletteLine(float id) {
@@ -198,16 +248,6 @@ export class SimpleOutlinePass extends Pass {
             return floor(texture2D(tMask, uv).r * 255.0 + 0.5);
           }
 
-          float isSelectedDepthVisible(float selectedDepth, float sceneDepth) {
-            float epsilon = reversedDepth
-              ? max(abs(sceneDepth) * 0.000001, 0.000000000001)
-              : 1.0 / 16777216.0;
-            if (reversedDepth) {
-              return selectedDepth + epsilon >= sceneDepth ? 1.0 : 0.0;
-            }
-            return selectedDepth <= sceneDepth + epsilon ? 1.0 : 0.0;
-          }
-
           void main() {
             vec4 scene = texture2D(tDiffuse, vUv);
             vec4 mask = texture2D(tMask, vUv);
@@ -218,23 +258,19 @@ export class SimpleOutlinePass extends Pass {
               return;
             }
 
-            // Inward outline: we are inside group centerId. Apply its fill,
-            // and if any pixel within this group's thickness belongs to a
-            // different id, we are near the group's interior silhouette and
-            // paint the outline color. This guarantees outlines never spill
-            // past the group's own footprint.
+            // Inward outline: we are inside group centerId. Without a scene
+            // fill, apply its fill here; if any pixel within this group's
+            // thickness belongs to a different id, we are near the group's
+            // interior silhouette and paint the outline color. This
+            // guarantees outlines never spill past the group's own footprint.
             vec4 fill = paletteFill(centerId);
             vec4 line = paletteLine(centerId);
             float t = line.a * 255.0;
             vec2 texel = 1.0 / resolution;
 
-            float selectedDepth = texture2D(tSelectedDepth, vUv).x;
-            float fillVisibility = 0.0;
-            if (hasSceneDepth) {
-              float sceneDepth = texture2D(tSceneDepth, vUv).x;
-              fillVisibility = isSelectedDepthVisible(selectedDepth, sceneDepth);
-            }
-            vec3 rgb = mix(scene.rgb, fill.rgb, fill.a * fillVisibility);
+            vec3 rgb = compositeFill
+              ? mix(scene.rgb, fill.rgb, fill.a)
+              : scene.rgb;
 
             float edge = 0.0;
             for (float y = -maxThickness; y <= maxThickness; y += 1.0) {
@@ -249,28 +285,6 @@ export class SimpleOutlinePass extends Pass {
 
             if (edge > 0.5) rgb = line.rgb;
             gl_FragColor = vec4(rgb, 1.0);
-          }
-        `,
-        depthTest: false,
-        depthWrite: false,
-      }),
-    );
-
-    this._copyQuad = new FullScreenQuad(
-      new THREE.ShaderMaterial({
-        uniforms: { tDiffuse: { value: null } },
-        vertexShader: `
-          varying vec2 vUv;
-          void main() {
-            vUv = uv;
-            gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0);
-          }
-        `,
-        fragmentShader: `
-          uniform sampler2D tDiffuse;
-          varying vec2 vUv;
-          void main() {
-            gl_FragColor = texture2D(tDiffuse, vUv);
           }
         `,
         depthTest: false,
@@ -317,12 +331,7 @@ export class SimpleOutlinePass extends Pass {
    * (with id baked in) and visual config. No hard cap on active groups beyond
    * the palette size (255 concurrent).
    */
-  addGroup(
-    name: string,
-    config?: Partial<
-      Omit<OutlineGroup, "id" | "name" | "container" | "material">
-    >,
-  ) {
+  addGroup(name: string, config?: OutlineGroupConfig) {
     let group = this._groups.get(name);
     if (group) {
       if (config) this.configureGroup(name, config);
@@ -351,14 +360,33 @@ export class SimpleOutlinePass extends Pass {
     container.renderOrder = priority;
     this._rootScene.add(container);
 
+    const fillColor = config?.fillColor?.clone() ?? new THREE.Color(0xffff00);
+    const fillOpacity = config?.fillOpacity ?? 0.3;
+    const fillMaterial = new THREE.MeshBasicMaterial({
+      color: fillColor,
+      opacity: fillOpacity,
+      transparent: true,
+      depthWrite: false,
+      depthFunc: THREE.LessEqualDepth,
+      // A fill coincides with its outlined surface; the smallest resolvable
+      // depth step towards the camera lets it win that tie and nothing else.
+      polygonOffset: true,
+      polygonOffsetFactor: -1,
+      polygonOffsetUnits: this._fillOffsetUnits,
+      // Fills end at a section cut like the mask and the source geometry.
+      clippingPlanes: this._world.renderer?.clippingPlanes ?? null,
+      toneMapped: false,
+    });
+
     group = {
       id,
       name,
       container,
       material,
+      fillMaterial,
       outlineColor: config?.outlineColor?.clone() ?? new THREE.Color(0xffc800),
-      fillColor: config?.fillColor?.clone() ?? new THREE.Color(0xffff00),
-      fillOpacity: config?.fillOpacity ?? 0.3,
+      fillColor,
+      fillOpacity,
       thickness: config?.thickness ?? 2,
       priority,
     };
@@ -373,12 +401,7 @@ export class SimpleOutlinePass extends Pass {
   /**
    * Updates an existing group's visual config.
    */
-  configureGroup(
-    name: string,
-    config: Partial<
-      Omit<OutlineGroup, "id" | "name" | "container" | "material">
-    >,
-  ) {
+  configureGroup(name: string, config: OutlineGroupConfig) {
     const group = this._groups.get(name);
     if (!group) return;
     if (config.outlineColor) group.outlineColor.copy(config.outlineColor);
@@ -390,6 +413,8 @@ export class SimpleOutlinePass extends Pass {
       group.priority = config.priority;
       group.container.renderOrder = config.priority;
     }
+    group.fillMaterial.color.copy(group.fillColor);
+    group.fillMaterial.opacity = group.fillOpacity;
     for (const target of this._outlinedTiles.values()) {
       if (target.groupName !== name) continue;
       target.proxy.visible = this.groupNeedsMask(group);
@@ -414,8 +439,10 @@ export class SimpleOutlinePass extends Pass {
     while (group.container.children.length) {
       group.container.children[0].removeFromParent();
     }
+    this.pruneMeshFills();
     group.container.removeFromParent();
     group.material.dispose();
+    group.fillMaterial.dispose();
     this._groups.delete(name);
     this._groupsById.delete(group.id);
     this.clearPaletteEntry(group.id);
@@ -439,6 +466,10 @@ export class SimpleOutlinePass extends Pass {
     if (!group) group = this.addGroup(name);
     mesh.material = group.material;
     group.container.add(mesh);
+    this._meshFills.get(mesh)?.removeFromParent();
+    const fill = this.createSceneFill(mesh.geometry, group.fillMaterial);
+    fill.frustumCulled = mesh.frustumCulled;
+    this._meshFills.set(mesh, fill);
   }
 
   // ---------------------------------------------------------------------------
@@ -505,6 +536,7 @@ export class SimpleOutlinePass extends Pass {
       groupName,
     };
     this._outlinedTiles.set(key, target);
+    this.addTileFill(target);
   }
 
   /**
@@ -625,7 +657,6 @@ export class SimpleOutlinePass extends Pass {
 
   setSize(width: number, height: number) {
     this._maskTarget.setSize(width, height);
-    this._compositeTarget?.setSize(width, height);
     const mat = this._fsQuad.material as THREE.ShaderMaterial;
     mat.uniforms.resolution.value.set(width, height);
   }
@@ -677,57 +708,72 @@ export class SimpleOutlinePass extends Pass {
     }
 
     const mat = this._fsQuad.material as THREE.ShaderMaterial;
-    const sceneDepthTexture = this._getSceneDepthTexture();
     mat.uniforms.tDiffuse.value = readBuffer.texture;
     mat.uniforms.tMask.value = this._maskTarget.texture;
-    mat.uniforms.tSelectedDepth.value = this._maskTarget.depthTexture;
-    mat.uniforms.tSceneDepth.value = sceneDepthTexture;
     mat.uniforms.maxThickness.value = this._maxThickness;
-    mat.uniforms.hasSceneDepth.value = sceneDepthTexture !== null;
-    mat.uniforms.reversedDepth.value =
-      (
-        renderer.capabilities as THREE.WebGLRenderer["capabilities"] & {
-          reversedDepthBuffer?: boolean;
-        }
-      ).reversedDepthBuffer === true;
-
-    const sceneDepthAliasesOutput = this.shouldStageComposite(
-      sceneDepthTexture,
-      writeBuffer,
-    );
-    const compositeTarget = sceneDepthAliasesOutput
-      ? this.getCompositeTarget(writeBuffer)
-      : this.renderToScreen
-        ? null
-        : writeBuffer;
-    renderer.setRenderTarget(compositeTarget);
+    mat.uniforms.compositeFill.value = this.compositeFill;
+    renderer.setRenderTarget(this.renderToScreen ? null : writeBuffer);
     this._fsQuad.render(renderer);
+  }
 
-    if (sceneDepthAliasesOutput) {
-      const copyMat = this._copyQuad.material as THREE.ShaderMaterial;
-      copyMat.uniforms.tDiffuse.value = compositeTarget!.texture;
-      renderer.setRenderTarget(writeBuffer);
-      this._copyQuad.render(renderer);
+  /**
+   * Shows the fills for one render of `scene`. The base pass calls this
+   * around its scene render, so other passes and frames without this pass
+   * never draw the fills.
+   */
+  showSceneFills(scene: THREE.Object3D) {
+    // An item in several groups, such as a selection and its batch, gets the
+    // fill of the highest-priority group once.
+    for (const entry of this._tileFills.values()) {
+      entry.fills.length = 0;
+      const targets = [...entry.targets]
+        .map((target) => ({
+          target,
+          group: this._groups.get(target.groupName),
+        }))
+        .filter(({ group }) => group && group.fillOpacity > 0)
+        .sort((a, b) => b.group!.priority - a.group!.priority);
+      for (const { target, group } of targets) {
+        entry.fills.push({
+          ranges: target.ranges,
+          material: group!.fillMaterial,
+        });
+      }
+      if (entry.fills.length > 0) this.installTileHook(entry);
     }
+    if (this._sceneFills.parent !== scene) scene.add(this._sceneFills);
+    this.pruneMeshFills();
+    for (const [mesh, fill] of this._meshFills) {
+      const group = this.getMeshGroup(mesh)!;
+      mesh.updateWorldMatrix(true, false);
+      this.syncProxyTransform(fill, mesh);
+      fill.visible = group.fillOpacity > 0 && mesh.visible;
+    }
+    this._sceneFills.visible = true;
+  }
+
+  hideSceneFills() {
+    for (const entry of this._tileFills.values()) this.uninstallTileHook(entry);
+    this._sceneFills.visible = false;
   }
 
   dispose() {
     // FullScreenQuad.dispose() only disposes its internal geometry; the
     // materials we passed in are our responsibility.
     (this._fsQuad.material as THREE.Material).dispose();
-    (this._copyQuad.material as THREE.Material).dispose();
     (this._debugQuad.material as THREE.Material).dispose();
     this._fsQuad.dispose();
-    this._copyQuad.dispose();
     this._debugQuad.dispose();
 
     this._maskTarget.dispose();
-    this._compositeTarget?.dispose();
     this._paletteTexture.dispose();
 
     for (const target of this._outlinedTiles.values())
       this.destroyOutlinedTileProxy(target);
     this._outlinedTiles.clear();
+    for (const fill of this._meshFills.values()) fill.removeFromParent();
+    this._meshFills.clear();
+    this._sceneFills.removeFromParent();
 
     for (const group of this._groups.values()) {
       while (group.container.children.length) {
@@ -735,32 +781,154 @@ export class SimpleOutlinePass extends Pass {
       }
       group.container.removeFromParent();
       group.material.dispose();
+      group.fillMaterial.dispose();
     }
     this._groups.clear();
     this._groupsById.clear();
   }
 
-  private shouldStageComposite(
-    sceneDepthTexture: THREE.DepthTexture | null,
-    writeBuffer: THREE.WebGLRenderTarget,
-  ) {
-    return (
-      !this.renderToScreen &&
-      sceneDepthTexture !== null &&
-      sceneDepthTexture === writeBuffer.depthTexture
-    );
+  /** Tracks a tile's outline groups; its hook is installed per scene render. */
+  private addTileFill(target: OutlinedTileProxy) {
+    const tile = target.source;
+    const existing = this._tileFills.get(tile);
+    if (existing) {
+      existing.targets.add(target);
+      return;
+    }
+    const entry: TileFill = {
+      tile,
+      targets: new Set([target]),
+      fills: [],
+      installed: false,
+      previous: undefined,
+      hook: (renderer, scene, camera, geometry, material, group) => {
+        entry.previous?.call(
+          tile,
+          renderer,
+          scene,
+          camera,
+          geometry,
+          material,
+          group,
+        );
+        this.drawTileFill(entry, renderer, scene, camera, geometry, group);
+      },
+    };
+    this._tileFills.set(tile, entry);
   }
 
-  private getCompositeTarget(template: THREE.WebGLRenderTarget) {
-    if (this._compositeTarget) return this._compositeTarget;
-    const target = template.clone();
-    target.depthTexture?.dispose();
-    target.depthTexture = null;
-    target.depthBuffer = false;
-    target.stencilBuffer = false;
-    target.texture.name = "SimpleOutlinePass.composite";
-    this._compositeTarget = target;
-    return target;
+  private removeTileFill(target: OutlinedTileProxy) {
+    const tile = target.source;
+    const entry = this._tileFills.get(tile);
+    if (!entry) return;
+    entry.targets.delete(target);
+    if (entry.targets.size > 0) return;
+    this.uninstallTileHook(entry);
+    this._tileFills.delete(tile);
+  }
+
+  /**
+   * A tile with a hook draws every range separately: three.js batches ranges
+   * only of tiles without one. So only tiles with a fill get the hook, and only
+   * for the scene render that draws it.
+   */
+  private installTileHook(entry: TileFill) {
+    if (entry.installed) return;
+    const { tile } = entry;
+    entry.previous = Object.prototype.hasOwnProperty.call(tile, "onAfterRender")
+      ? tile.onAfterRender
+      : undefined;
+    tile.onAfterRender = entry.hook;
+    entry.installed = true;
+  }
+
+  private uninstallTileHook(entry: TileFill) {
+    if (!entry.installed) return;
+    entry.installed = false;
+    const { tile } = entry;
+    if (tile.onAfterRender === entry.hook) {
+      if (entry.previous) tile.onAfterRender = entry.previous;
+      else Reflect.deleteProperty(tile, "onAfterRender");
+    }
+    entry.previous = undefined;
+  }
+
+  /** Paints the outlined parts of the range three.js has just drawn. */
+  private drawTileFill(
+    entry: TileFill,
+    renderer: THREE.WebGLRenderer,
+    scene: THREE.Scene,
+    camera: THREE.Camera,
+    geometry: THREE.BufferGeometry,
+    // three.js passes the drawn geometry group, typed as a scene Group.
+    group: unknown,
+  ) {
+    const drawn = group as THREE.GeometryGroup | null;
+    const start = drawn ? drawn.start : geometry.drawRange.start;
+    const end = start + (drawn ? drawn.count : geometry.drawRange.count);
+    // Runs for every drawn range of an outlined tile: no allocations.
+    const starts = this._filledStarts;
+    const ends = this._filledEnds;
+    starts.length = 0;
+    ends.length = 0;
+    for (const fill of entry.fills) {
+      for (const range of fill.ranges) {
+        const from = Math.max(start, range.start);
+        const to = Math.min(end, range.start + range.count);
+        if (to <= from || this.wasFilled(from, to)) continue;
+        starts.push(from);
+        ends.push(to);
+        this._fillRange.start = from;
+        this._fillRange.count = to - from;
+        renderer.renderBufferDirect(
+          camera,
+          scene,
+          geometry,
+          fill.material,
+          entry.tile,
+          this._fillRange,
+        );
+      }
+    }
+  }
+
+  private wasFilled(from: number, to: number) {
+    for (let i = 0; i < this._filledStarts.length; i++) {
+      if (this._filledStarts[i] === from && this._filledEnds[i] === to) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  private createSceneFill(
+    geometry: THREE.BufferGeometry,
+    material: THREE.Material | THREE.Material[],
+  ) {
+    const fill = new THREE.Mesh(geometry, material);
+    fill.matrixAutoUpdate = false;
+    fill.matrixWorldAutoUpdate = false;
+    fill.frustumCulled = false;
+    // A display twin of geometry that is already pickable.
+    fill.raycast = () => {};
+    this._sceneFills.add(fill);
+    return fill;
+  }
+
+  private getMeshGroup(mesh: THREE.Mesh) {
+    for (const group of this._groups.values()) {
+      if (mesh.parent === group.container) return group;
+    }
+    return undefined;
+  }
+
+  /** Releases fill twins of meshes that have left their group. */
+  private pruneMeshFills() {
+    for (const [mesh, fill] of this._meshFills) {
+      if (this.getMeshGroup(mesh)) continue;
+      fill.removeFromParent();
+      this._meshFills.delete(mesh);
+    }
   }
 
   /**
@@ -815,6 +983,7 @@ export class SimpleOutlinePass extends Pass {
 
   private destroyOutlinedTileProxy(target: OutlinedTileProxy) {
     target.proxy.removeFromParent();
+    this.removeTileFill(target);
     const geometry = target.proxy.geometry;
     // Release the wrapper's renderer/VAO registration, not the source buffers.
     // Replace the alias maps instead of deleting entries from the shared maps.
@@ -824,7 +993,7 @@ export class SimpleOutlinePass extends Pass {
     geometry.dispose();
   }
 
-  private syncProxyTransform(proxy: THREE.Mesh, source: THREE.Mesh) {
+  private syncProxyTransform(proxy: THREE.Mesh, source: THREE.Object3D) {
     proxy.matrixWorld.copy(source.matrixWorld);
     proxy.renderOrder = source.renderOrder;
     proxy.layers.mask = source.layers.mask;

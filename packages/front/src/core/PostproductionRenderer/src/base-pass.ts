@@ -1,5 +1,6 @@
 import * as THREE from "three";
 import { Pass } from "three/examples/jsm/postprocessing/Pass.js";
+import type { SimpleOutlinePass } from "./simple-outline-pass";
 
 // Copied from three.js RenderPass.js, extended to allow for material override
 // useful to exclude lod materials
@@ -14,10 +15,16 @@ export class BasePass extends Pass {
 
   isolatedMaterials: THREE.Material[] = [];
 
+  /**
+   * Outline fills drawn inside this scene render, after opaque and before
+   * translucent surfaces, so they blend like the outlined geometry.
+   */
+  outlineFills: Pick<
+    SimpleOutlinePass,
+    "showSceneFills" | "hideSceneFills"
+  > | null = null;
+
   private _oldClearColor: THREE.Color;
-  private _onSceneDepthRendered: (
-    depthTexture: THREE.DepthTexture | null,
-  ) => void;
 
   constructor(
     scene: THREE.Scene,
@@ -25,7 +32,6 @@ export class BasePass extends Pass {
     overrideMaterial = null,
     clearColor = null,
     clearAlpha = null,
-    onSceneDepthRendered: (depthTexture: THREE.DepthTexture | null) => void,
   ) {
     super();
 
@@ -42,7 +48,6 @@ export class BasePass extends Pass {
     this.clear = true;
 
     this.clearDepth = false;
-    this._onSceneDepthRendered = onSceneDepthRendered;
 
     this.needsSwap = false;
     this._oldClearColor = new THREE.Color();
@@ -98,8 +103,12 @@ export class BasePass extends Pass {
       );
     }
 
-    renderer.render(this.scene, this.camera);
-    this._onSceneDepthRendered(readBuffer.depthTexture);
+    this.outlineFills?.showSceneFills(this.scene);
+    try {
+      renderer.render(this.scene, this.camera);
+    } finally {
+      this.outlineFills?.hideSceneFills();
+    }
 
     // restore
 

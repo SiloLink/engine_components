@@ -19,7 +19,7 @@ test("tile retirement cannot render an uploaded, CPU-released attribute while ch
     camera: { three: new THREE.PerspectiveCamera() },
     isDisposing: false,
   };
-  const pass = new SimpleOutlinePass(64, 64, world as never, () => null, false);
+  const pass = new SimpleOutlinePass(64, 64, world as never, false);
   Object.assign(world, {
     renderer: {
       postproduction: {
@@ -102,7 +102,6 @@ for (const cleanup of ["detach", "remove-group", "dispose"] as const) {
       64,
       64,
       { camera: { three: new THREE.PerspectiveCamera() } } as never,
-      () => null,
       false,
     );
     pass.addGroup("selection");
@@ -127,6 +126,10 @@ for (const cleanup of ["detach", "remove-group", "dispose"] as const) {
     const proxy = pass.getGroupContainer("selection").children[0] as THREE.Mesh;
     geometries.get(proxy, proxy.geometry);
     assert.equal(info.memory.geometries, 2);
+    // The fill draws the source geometry from the tile's own render hook,
+    // installed for the scene render; cleanup in the middle releases it.
+    pass.showSceneFills(new THREE.Scene());
+    assert.ok(Object.prototype.hasOwnProperty.call(tile, "onAfterRender"));
 
     if (cleanup === "detach") pass.detachOutlinedTile(tile, "selection");
     else if (cleanup === "remove-group") pass.removeGroup("selection");
@@ -139,6 +142,10 @@ for (const cleanup of ["detach", "remove-group", "dispose"] as const) {
     assert.equal(source.index, sourceIndex);
     assert.ok(source.attributes.position);
     assert.equal(proxy.parent, null);
+    assert.equal(
+      Object.prototype.hasOwnProperty.call(tile, "onAfterRender"),
+      false,
+    );
     if (cleanup !== "dispose") pass.dispose();
     source.dispose();
     tile.material.dispose();

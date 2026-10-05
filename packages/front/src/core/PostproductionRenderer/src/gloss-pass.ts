@@ -140,9 +140,8 @@ export class GlossPass extends Pass {
     material.uniforms.glossBuffer.value = this.glossBuffer.texture;
     material.uniforms.sceneColorBuffer.value = readBuffer.texture;
 
-    // Render the final gloss effect. It overwrites every pixel, so it must
-    // not clear the target first: that would also clear its depth texture,
-    // which can be the captured scene depth that later passes test against.
+    // Render the final gloss effect. It overwrites every pixel, so clearing
+    // the target first would be wasted work.
     renderer.setRenderTarget(this.renderToScreen ? null : writeBuffer);
     const previousAutoClear = renderer.autoClear;
     renderer.autoClear = false;
