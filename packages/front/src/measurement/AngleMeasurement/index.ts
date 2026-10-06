@@ -7,7 +7,7 @@ import { Angle } from "../../utils";
 import { Mark } from "../../core";
 import { Measurement } from "../Measurement";
 import { MeasureLine } from "./src/types";
-import { newDimensionMark, newEndPoint } from "../utils";
+import { newDimensionMark } from "../utils";
 import {
   AngleMeasurerModes,
   AngleMeasurerTempData,
@@ -348,9 +348,9 @@ export class AngleMeasurement extends Measurement<Angle, "angle"> {
 
     // Endpoints at all 3 points
     const endpoints = [
-      this.createEndpointMark(group, angle.start, colorHex),
-      this.createEndpointMark(group, angle.vertex, colorHex),
-      this.createEndpointMark(group, angle.end, colorHex),
+      this.createEndpointMark(group, angle.start),
+      this.createEndpointMark(group, angle.vertex),
+      this.createEndpointMark(group, angle.end),
     ];
 
     // Label
@@ -417,17 +417,16 @@ export class AngleMeasurement extends Measurement<Angle, "angle"> {
 
   // -- Helpers --
 
+  // Endpoints take the measurement's shared endpoint element, like the
+  // dimension lines of the other tools, so one element styles every tool.
   private createEndpointMark(
     parent: THREE.Object3D,
     position: THREE.Vector3,
-    color?: string,
   ): Mark {
     if (!this.world) {
       throw new Error("AngleMeasurement: world is needed!");
     }
-    const element = newEndPoint({
-      border: `2px solid ${color ?? `#${this.linesMaterial.color.getHexString()}`}`,
-    });
+    const element = this.linesEndpointElement.cloneNode(true) as HTMLElement;
     const mark = new Mark(this.world, element, parent);
     mark.three.position.copy(position);
     return mark;
