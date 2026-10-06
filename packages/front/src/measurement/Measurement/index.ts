@@ -13,7 +13,7 @@ import {
   MeasureFill,
   Volume,
 } from "../../utils";
-import { newDimensionMark } from "../utils";
+import { newEndPoint } from "../utils";
 import { Mark } from "../../core";
 import {
   defaultUnits,
@@ -499,7 +499,7 @@ export abstract class Measurement<
     return this._rounding;
   }
 
-  private _linesEndpointElement: HTMLElement = newDimensionMark();
+  private _linesEndpointElement: HTMLElement = newEndPoint();
   set linesEndpointElement(value: HTMLElement) {
     this._linesEndpointElement = value;
     for (const line of this.lines) {

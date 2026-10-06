@@ -232,6 +232,9 @@ export class DimensionLine {
 
     this._endpoints.onBeforeDelete.add((mark) => mark.dispose());
 
+    if (data.endpointElement) {
+      this._endpointElement = data.endpointElement;
+    }
     this.createEndpoints();
 
     for (const endpoint of this._endpoints) {
@@ -389,9 +392,14 @@ export class DimensionLine {
     return this._endpointElement;
   }
 
+  // The element is shared by every line of a measurement, so each marker
+  // takes its own clone.
   private createEndpoints() {
     this._endpoints.clear();
-    const startMarker = new Mark(this.world, this._endpointElement);
+    const startMarker = new Mark(
+      this.world,
+      this._endpointElement.cloneNode(true) as HTMLElement,
+    );
     const endMarker = new Mark(
       this.world,
       this._endpointElement.cloneNode(true) as HTMLElement,
