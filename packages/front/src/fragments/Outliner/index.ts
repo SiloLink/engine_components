@@ -58,6 +58,11 @@ interface OutlineGroupState {
   attached: Map<string, Set<THREE.Mesh>>;
   /** Last successfully resolved chunks, keyed by model and current tile. */
   resolved: Map<string, Map<THREE.Mesh, readonly OutlinerPickCandidateRange[]>>;
+  /** Models awaiting a refresh; a full selection update takes precedence. */
+  dirtyModels: Set<string>;
+  refreshAll: boolean;
+  update?: Promise<void>;
+  background: boolean;
   activeStyles: Set<string>;
   styleCallbacks: {
     [style: string]: {
@@ -133,9 +138,7 @@ export class Outliner extends OBC.Component implements OBC.Disposable {
         (localIds) => localIds.size > 0,
       );
       if (!hasItems) continue;
-      this.updateGroup(name).catch((error) => {
-        this._backgroundErrors.push(error);
-      });
+      this.updateGroup(name, undefined, true);
     }
   }
 
@@ -431,7 +434,7 @@ export class Outliner extends OBC.Component implements OBC.Disposable {
     const state = this.ensureGroup(group);
     OBC.ModelIdMapUtils.add(state.map, modelIdMap);
     state.resolved = new Map();
-    await this.updateGroup(group, modelIdMap);
+    await this.updateGroup(group);
   }
 
   /**
@@ -446,17 +449,14 @@ export class Outliner extends OBC.Component implements OBC.Disposable {
   }
 
   /**
-   * Updates outline meshes for a given group, or for the default if omitted.
+   * Refreshes every selected model in the given group, or the default group
+   * if omitted. Resolves once the group's latest requested update is applied.
    *
-   * When `modelIdMap` is provided and differs from the group's current map,
-   * meshes for that delta are appended (existing group meshes stay).
+   * The optional model map is retained for compatibility and does not change
+   * the selection. Use {@link addItems} or {@link removeItems} to change it.
    */
-  async update(modelIdMap?: OBC.ModelIdMap, group = DEFAULT_GROUP) {
-    if (modelIdMap === undefined) {
-      await this.updateGroup(group);
-    } else {
-      await this.updateGroup(group, modelIdMap);
-    }
+  async update(_modelIdMap?: OBC.ModelIdMap, group = DEFAULT_GROUP) {
+    await this.updateGroup(group);
   }
 
   /** Waits for automatic tile and model lifecycle outline updates to settle. */
@@ -563,6 +563,9 @@ export class Outliner extends OBC.Component implements OBC.Disposable {
       config: {},
       attached: new Map(),
       resolved: new Map(),
+      dirtyModels: new Set(),
+      refreshAll: false,
+      background: false,
       activeStyles: new Set(),
       styleCallbacks: {},
     };
@@ -663,18 +666,60 @@ export class Outliner extends OBC.Component implements OBC.Disposable {
    * Outline color, fill, and thickness come from the pass's group config.
    * The Outliner only feeds it the geometry slices.
    */
-  private updateGroup(name: string, delta?: OBC.ModelIdMap) {
-    const revision = (this._updateRevisions.get(name) ?? 0) + 1;
-    this._updateRevisions.set(name, revision);
-    return this.trackUpdate(this.performGroupUpdate(name, delta, revision));
+  private updateGroup(name: string, modelId?: string, background = false) {
+    const state = this.ensureGroup(name);
+    this._updateRevisions.set(name, (this._updateRevisions.get(name) ?? 0) + 1);
+    if (modelId === undefined) state.refreshAll = true;
+    else state.dirtyModels.add(modelId);
+    state.background ||= background;
+    if (state.update) return state.update;
+
+    // One microtask combines synchronous tile batches. Requests made while a
+    // query runs share its promise and queue a subsequent refresh instead of
+    // starting another worker query for the same group.
+    const update = Promise.resolve().then(async () => {
+      try {
+        while (state.refreshAll || state.dirtyModels.size > 0) {
+          const modelIds = state.refreshAll ? undefined : state.dirtyModels;
+          state.refreshAll = false;
+          state.dirtyModels = new Set();
+          const revision = this._updateRevisions.get(name)!;
+          try {
+            await this.performGroupUpdate(name, state, revision, modelIds);
+          } catch (error) {
+            // Only the latest requested result can commit. A failed query
+            // superseded by a refresh or cleanup no longer owns the result.
+            if (this._updateRevisions.get(name) === revision) throw error;
+          }
+          if (this._groups.get(name) !== state) break;
+          if (state.refreshAll || state.dirtyModels.size > 0) {
+            // The superseded result did not commit: carry its models into
+            // the next query as well as models dirtied while it was running.
+            if (!modelIds) state.refreshAll = true;
+            else for (const id of modelIds) state.dirtyModels.add(id);
+          }
+        }
+      } catch (error) {
+        if (state.background) this._backgroundErrors.push(error);
+        throw error;
+      } finally {
+        state.update = undefined;
+        state.background = false;
+      }
+    });
+    state.update = this.trackUpdate(update);
+    // Automatic lifecycle callers have no promise consumer. The same promise
+    // still rejects for explicit callers; whenSettled reports background errors.
+    state.update.catch(() => undefined);
+    return state.update;
   }
 
   private async performGroupUpdate(
     name: string,
-    _delta: OBC.ModelIdMap | undefined,
+    state: OutlineGroupState,
     revision: number,
+    modelIds?: Set<string>,
   ) {
-    const state = this.ensureGroup(name);
     const world = this.world;
     if (!world) return;
     const renderer = this.getRenderer(world);
@@ -703,11 +748,17 @@ export class Outliner extends OBC.Component implements OBC.Disposable {
     for (const [modelId, tiles] of state.attached) {
       previouslyAttached.set(modelId, new Set(tiles));
     }
-    const nextAttached = new Map<string, Set<THREE.Mesh>>();
+    const nextAttached = new Map(modelIds ? state.attached : undefined);
     const nextResolved = new Map<
       string,
       Map<THREE.Mesh, readonly OutlinerPickCandidateRange[]>
-    >();
+    >(modelIds ? state.resolved : undefined);
+    if (modelIds) {
+      for (const modelId of modelIds) {
+        nextAttached.delete(modelId);
+        nextResolved.delete(modelId);
+      }
+    }
 
     // Run the chunk query per model in parallel. Each query returns one
     // entry per affected tile with parallel `position` / `size` arrays.
@@ -723,6 +774,7 @@ export class Outliner extends OBC.Component implements OBC.Disposable {
       }>
     > = [];
     for (const [modelId, localIds] of Object.entries(map)) {
+      if (modelIds && !modelIds.has(modelId)) continue;
       if (localIds.size === 0) continue;
       this.bindModelTileEvents(modelId);
       const model = fragments.list.get(modelId);
@@ -742,8 +794,13 @@ export class Outliner extends OBC.Component implements OBC.Disposable {
       );
     }
 
-    const results = await Promise.all(queries);
+    // Wait for every query even on failure before starting the next refresh.
+    const settled = await Promise.allSettled(queries);
     if (!this.isGroupUpdateCurrent(name, state, revision, world, pass)) return;
+    const results = settled.map((result) => {
+      if (result.status === "rejected") throw result.reason;
+      return result.value;
+    });
 
     // Attach (or refresh) every tile that came back; track attachments
     // for next-time diffs.
@@ -803,6 +860,12 @@ export class Outliner extends OBC.Component implements OBC.Disposable {
 
   private invalidateGroup(name: string) {
     this._updateRevisions.set(name, (this._updateRevisions.get(name) ?? 0) + 1);
+    const state = this._groups.get(name);
+    if (state) {
+      state.refreshAll = false;
+      state.dirtyModels.clear();
+      state.background = false;
+    }
   }
 
   private trackUpdate<T>(update: Promise<T>): Promise<T> {
@@ -935,11 +998,7 @@ export class Outliner extends OBC.Component implements OBC.Disposable {
     for (const [groupName, state] of this._groups) {
       const localIds = state.map[modelId];
       if (localIds && localIds.size > 0) {
-        this.trackUpdate(
-          this.updateGroup(groupName).catch((error) => {
-            this._backgroundErrors.push(error);
-          }),
-        );
+        this.updateGroup(groupName, modelId, true);
       }
     }
   }
