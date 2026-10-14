@@ -232,9 +232,9 @@ export class PostproductionRenderer extends RendererWith2D {
     if (!this.container || !this._postproduction) {
       return;
     }
-    const ratio = Math.min(window.devicePixelRatio, 2);
-    const width = size?.x ?? this.container.clientWidth * ratio;
-    const height = size?.y ?? this.container.clientHeight * ratio;
+    // CSS pixels, like the resize event: the composer applies its pixel ratio.
+    const width = size?.x ?? this.container.clientWidth;
+    const height = size?.y ?? this.container.clientHeight;
     if (width === 0 || height === 0) {
       return;
     }

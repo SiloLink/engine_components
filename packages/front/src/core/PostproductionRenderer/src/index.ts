@@ -335,21 +335,30 @@ export class Postproduction {
     this._glossPass?.dispose();
   }
 
+  /**
+   * Sizes the composer and every pass in device pixels. Width and height are
+   * CSS pixels, which the composer scales by its pixel ratio; the passes it
+   * does not hold take the same device size, so a pass keeps its resolution
+   * whether it was last sized here or when the composer added it.
+   */
   setSize(width: number, height: number) {
     if (width === 0 || height === 0) {
       return;
     }
-    if (this.composer) {
-      this.composer.setSize(width, height);
+    if (!this.composer) {
+      return;
     }
+    this.composer.setSize(width, height);
+    const { width: deviceWidth, height: deviceHeight } =
+      this.composer.renderTarget1;
     if (this._simpleOutlinePass) {
-      this._simpleOutlinePass.setSize(width, height);
+      this._simpleOutlinePass.setSize(deviceWidth, deviceHeight);
     }
     if (this._excludedObjectsPass) {
-      this._excludedObjectsPass.setSize(width, height);
+      this._excludedObjectsPass.setSize(deviceWidth, deviceHeight);
     }
     if (this._glossPass) {
-      this._glossPass.setSize(width, height);
+      this._glossPass.setSize(deviceWidth, deviceHeight);
     }
   }
 
