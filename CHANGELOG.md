@@ -6,6 +6,7 @@
 
 * Coalesce Outliner tile refreshes per group, query only changed models, and wait for in-flight queries before refreshing the latest state.
 * Size postproduction passes in the composer's device pixels: `setSize` takes CSS pixels like the resize event, so the outline, excluded-objects and gloss passes keep one resolution whether they were last resized or rebuilt.
+* Draw only model tiles, LOD included, into the edge detection buffer, so grids, measurements and gizmos are no longer outlined as geometry; tiles keep the layers they had.
 
 ## [3.4.0](https://github.com/ThatOpen/engine_components/compare/v3.3.2...v3.4.0) (2026-04-09)
 

@@ -20,6 +20,17 @@ export enum EdgeDetectionPassMode {
 }
 
 export class EdgeDetectionPass extends Pass {
+  /**
+   * The layer that holds the model tiles while the edge buffer is drawn, so
+   * only model geometry reaches it. Any other drawable, such as a grid, a
+   * measurement or a gizmo, would add its own color to the buffer and be
+   * outlined as if it were geometry.
+   */
+  private static readonly _modelLayer = 31;
+
+  // The tiles this pass put on the model layer, so it takes only them off.
+  private _modelLayerTiles: THREE.Object3D[] = [];
+
   private _edgeCompositeMaterial: THREE.ShaderMaterial;
   private _fsQuad: FullScreenQuad;
   private _vertexColorRenderTarget: THREE.WebGLRenderTarget;
@@ -245,8 +256,12 @@ export class EdgeDetectionPass extends Pass {
     const prevBackground = currentScene.background;
     currentScene.fog = null;
     currentScene.background = null;
+    const camera = currentWorld!.camera.three;
+    const prevLayers = camera.layers.mask;
 
     try {
+      this.setModelLayer(true);
+      camera.layers.set(EdgeDetectionPass._modelLayer);
       if (this._mode === EdgeDetectionPassMode.DEFAULT) {
         const previousMaterials = new Map<
           THREE.Mesh,
@@ -270,6 +285,8 @@ export class EdgeDetectionPass extends Pass {
         }
       }
     } finally {
+      camera.layers.mask = prevLayers;
+      this.setModelLayer(false);
       currentScene.fog = prevFog;
       currentScene.background = prevBackground;
     }
@@ -304,6 +321,27 @@ export class EdgeDetectionPass extends Pass {
     this._overrideMaterial.dispose();
     this._fsQuad.dispose();
     this._vertexColorRenderTarget.dispose();
+  }
+
+  /**
+   * Puts every model tile, its LOD included, on the model layer, or takes off
+   * the tiles it put there, keeping the layers they had before.
+   */
+  private setModelLayer(active: boolean) {
+    const layer = EdgeDetectionPass._modelLayer;
+    if (!active) {
+      for (const tile of this._modelLayerTiles) tile.layers.disable(layer);
+      this._modelLayerTiles = [];
+      return;
+    }
+    if (!this._fragments.initialized) return;
+    for (const [, model] of this._fragments.core.models.list) {
+      for (const [, mesh] of model.tiles) {
+        if (mesh.layers.isEnabled(layer)) continue;
+        mesh.layers.enable(layer);
+        this._modelLayerTiles.push(mesh);
+      }
+    }
   }
 
   private setMaterialToMesh(
