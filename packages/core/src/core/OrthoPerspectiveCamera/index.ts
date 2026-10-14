@@ -222,6 +222,14 @@ export class OrthoPerspectiveCamera extends SimpleCamera {
     if (!this.previousSize) return;
 
     const size = this.currentWorld.renderer.getSize();
+    // A canvas without a size, such as a hidden one, keeps the frustum and the
+    // size it was fitted to, so showing it again rescales from there.
+    if (size.x <= 0 || size.y <= 0) return;
+    // Without a size to scale from, the current one becomes the reference.
+    if (this.previousSize.x <= 0 || this.previousSize.y <= 0) {
+      this.previousSize.copy(size);
+      return;
+    }
 
     const previousHeight = this.threeOrtho.top;
     const previousWidth = this.threeOrtho.right;

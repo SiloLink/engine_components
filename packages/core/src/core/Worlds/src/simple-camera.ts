@@ -178,6 +178,9 @@ export class SimpleCamera extends BaseCamera implements Updateable, Disposable {
     }
     if (this.currentWorld.renderer?.isResizeable()) {
       const size = this.currentWorld.renderer.getSize();
+      // A canvas without a size, such as a hidden one, has no aspect to take:
+      // the camera keeps the one it last had.
+      if (size.width <= 0 || size.height <= 0) return;
       this.three.aspect = size.width / size.height;
       this.three.updateProjectionMatrix();
       this.onAspectUpdated.trigger();
