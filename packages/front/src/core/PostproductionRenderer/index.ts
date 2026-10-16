@@ -223,7 +223,8 @@ export class PostproductionRenderer extends RendererWith2D {
     this.resetManualModeState();
   }
 
-  private setPostproductionSize(size?: THREE.Vector2) {
+  /** Sizes the postproduction chain; subclasses may control allocation timing. */
+  protected setPostproductionSize(size?: THREE.Vector2) {
     if (size) {
       if (size.x === 0 || size.y === 0) {
         return;
