@@ -235,8 +235,17 @@ class ProjectedEdgeCollector {
 
 			// Wait for async WebGPU computation to complete
 			let webgpuFinished = false;
+			let webgpuError = null;
 			getBvhcastEdgesWebgpu( webgpuData, meshes, edgesBvh, hiddenOverlapMap, bvhStats ).then( () => {
 
+				webgpuFinished = true;
+
+			}, err => {
+
+				// A rejected WebGPU cast (no adapter, lost device...) must not
+				// leave this generator yielding forever: record the error and
+				// escape the wait loop, then surface it to the caller.
+				webgpuError = err;
 				webgpuFinished = true;
 
 			} );
@@ -244,6 +253,12 @@ class ProjectedEdgeCollector {
 			while ( ! webgpuFinished ) {
 
 				yield;
+
+			}
+
+			if ( webgpuError ) {
+
+				throw webgpuError;
 
 			}
 
@@ -359,7 +374,22 @@ export class ProjectionGenerator {
 
 				}
 
-				const result = task.next();
+				// task.next() can throw (e.g. a wait loop rethrowing a culler or
+				// WebGPU failure). Without this catch the error would escape a
+				// requestAnimationFrame callback and the promise would never
+				// settle, leaving callers awaiting forever.
+				let result;
+				try {
+
+					result = task.next();
+
+				} catch ( err ) {
+
+					reject( err );
+					return;
+
+				}
+
 				if ( result.done ) {
 
 					resolve( result.value );
@@ -399,11 +429,22 @@ export class ProjectionGenerator {
 
 			Logger.startStep( 'Visibility culling' );
 			let finished = false;
-			visibilityCuller.cull( scene ).then( res => {
+			let cullError = null;
+			// The signal lets the culler hand the renderer back the moment the
+			// task is aborted, rather than when its pending readback lands.
+			visibilityCuller.cull( scene, { signal: options.signal } ).then( res => {
 
 				// TODO: the functions should be able to handle an array of objects
 				scene = new Scene();
 				scene.children = res;
+				finished = true;
+
+			}, err => {
+
+				// A rejected cull (lost context, failed readback...) must not
+				// leave this generator yielding forever: record the error and
+				// escape the wait loop, then surface it to the caller.
+				cullError = err;
 				finished = true;
 
 			} );
@@ -411,6 +452,12 @@ export class ProjectionGenerator {
 			while ( ! finished ) {
 
 				yield;
+
+			}
+
+			if ( cullError ) {
+
+				throw cullError;
 
 			}
 

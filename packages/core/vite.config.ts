@@ -1,8 +1,8 @@
+/// <reference types="vitest/config" />
 /* eslint-disable import/no-extraneous-dependencies */
 import dts from "vite-plugin-dts";
 import { defineConfig } from "vite";
 import * as path from "path";
-import * as fs from "fs";
 import pluginTerser from "@rollup/plugin-terser";
 import * as packageJson from "./package.json";
 
@@ -80,6 +80,33 @@ export default defineConfig({
   plugins: [
     dts({
       rollupTypes: true,
+      // This overrides tsconfig-build.json's exclude rather than adding to
+      // it, so the example files have to be repeated here or they come back
+      // in and report TS2307 for their doc-only imports.
+      exclude: [
+        "node_modules/**",
+        "./src/**/example.ts",
+        "./src/**/*.test.ts",
+        "./src/**/*.spec.ts",
+      ],
     }),
   ],
+  test: {
+    // The default environment is node: most of the suite is plain logic over
+    // three and fragments objects. A file that needs a DOM opts in with
+    //
+    //   // @vitest-environment happy-dom
+    //
+    // as its first line.
+    environment: "node",
+    environmentOptions: { happyDOM: { url: "https://localhost" } },
+    setupFiles: ["./vitest.setup.ts"],
+    snapshotFormat: {
+      maxDepth: Infinity,
+      maxWidth: Infinity,
+      maxOutputLength: Infinity,
+    },
+    // Green on a tree with no test files: the suites land in a later PR.
+    passWithNoTests: true,
+  },
 });
