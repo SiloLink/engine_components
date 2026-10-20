@@ -80,6 +80,16 @@ function setup() {
   return { outliner, models, attached };
 }
 
+test("deprecated update adds its map and a plain refresh keeps the selection", async () => {
+  const { outliner, models } = setup();
+  const a = createModel();
+  models.set("a", a.model);
+  await outliner.addItems({ a: new Set([1]) }, "selection");
+  await outliner.update({ a: new Set([2]) }, "selection");
+  await outliner.update(undefined, "selection");
+  assert.deepEqual(a.calls, [[1], [1, 2], [1, 2]]);
+});
+
 test("a synchronous tile burst queries only the dirty model once per group", async () => {
   const { outliner, models } = setup();
   const a = createModel();

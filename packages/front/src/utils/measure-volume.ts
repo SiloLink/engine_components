@@ -4,17 +4,6 @@ import { Volume } from "./volume";
 import { MeasureMark } from "./measure-mark";
 
 /**
- * Per-tile chunk shape returned by `FragmentsModel.getItemDrawChunks`.
- * Re-declared here so we don't pull an internal fragments type into
- * MeasureVolume's signature.
- */
-interface ItemDrawChunks {
-  tileId: number;
-  position: Uint32Array;
-  size: Uint32Array;
-}
-
-/**
  * Visual representation of a {@link Volume} measurement.
  *
  * Items added to the volume are highlighted by **proxy meshes** that
@@ -166,9 +155,7 @@ export class MeasureVolume {
       const model = fragments.list.get(modelId);
       if (!model) continue;
       if (!localIds || (localIds as Set<number>).size === 0) continue;
-      const chunks = (await (model as any).getItemDrawChunks(
-        localIds,
-      )) as ItemDrawChunks[];
+      const chunks = await model.getItemDrawChunks(localIds);
       if (this._disposed || revision !== this._revision) return;
       if (fragments.list.get(modelId) !== model) continue;
       if (!chunks || chunks.length === 0) continue;

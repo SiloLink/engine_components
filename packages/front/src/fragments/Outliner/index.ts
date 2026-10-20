@@ -1,8 +1,8 @@
 import * as OBC from "@thatopen/components";
-import * as THREE from "three";
 import { DataSet, type FragmentsModel } from "@thatopen/fragments";
-import { Highlighter } from "../Highlighter";
+import * as THREE from "three";
 import { PostproductionRenderer } from "../../core";
+import { Highlighter } from "../Highlighter";
 
 class OutlinerUpdateError extends Error {
   readonly errors: unknown[];
@@ -449,14 +449,19 @@ export class Outliner extends OBC.Component implements OBC.Disposable {
   }
 
   /**
-   * Refreshes every selected model in the given group, or the default group
-   * if omitted. Resolves once the group's latest requested update is applied.
+   * Adds `modelIdMap` to the group's selection (the default group if omitted)
+   * and refreshes that group's outline. Identical to {@link addItems}; calling
+   * it with no map just refreshes the group without changing what it holds.
    *
-   * The optional model map is retained for compatibility and does not change
-   * the selection. Use {@link addItems} or {@link removeItems} to change it.
+   * Note this changed: `modelIdMap` used to be accepted and ignored, so the
+   * call was always a plain refresh and the group's selection only ever came
+   * from {@link addItems}. It now joins the group's map, which is what the
+   * argument always claimed to do. Pass nothing for the old behaviour.
+   *
+   * @deprecated call {@link addItems} instead.
    */
-  async update(_modelIdMap?: OBC.ModelIdMap, group = DEFAULT_GROUP) {
-    await this.updateGroup(group);
+  async update(modelIdMap?: OBC.ModelIdMap, group?: string) {
+    await this.addItems(modelIdMap ?? {}, group);
   }
 
   /** Waits for automatic tile and model lifecycle outline updates to settle. */
@@ -732,22 +737,13 @@ export class Outliner extends OBC.Component implements OBC.Disposable {
     }
 
     const map = OBC.ModelIdMapUtils.clone(state.map);
-    if (name === DEFAULT_GROUP && this.outlinePositions) {
-      const fragments = this.components.get(OBC.FragmentsManager);
-      const positions = await fragments.getPositions(map);
-      if (!this.isGroupUpdateCurrent(name, state, revision, world, pass)) {
-        return;
-      }
-      this.updatePoints(positions);
-    }
-
     const fragments = this.components.get(OBC.FragmentsManager);
+    // Points and chunks commit together under the same revision guard.
+    const points =
+      name === DEFAULT_GROUP && this.outlinePositions
+        ? fragments.getPositions(map)
+        : undefined;
 
-    // Snapshot current attachments so we can diff after the queries.
-    const previouslyAttached = new Map<string, Set<THREE.Mesh>>();
-    for (const [modelId, tiles] of state.attached) {
-      previouslyAttached.set(modelId, new Set(tiles));
-    }
     const nextAttached = new Map(modelIds ? state.attached : undefined);
     const nextResolved = new Map<
       string,
@@ -784,23 +780,25 @@ export class Outliner extends OBC.Component implements OBC.Disposable {
           // `getItemDrawChunks` accepts an iterable; we pass the Set
           // straight through to avoid materializing an array for very
           // large selections.
-          const chunks = (await model.getItemDrawChunks(localIds)) as Array<{
-            tileId: number;
-            position: Uint32Array;
-            size: Uint32Array;
-          }>;
+          const chunks = await model.getItemDrawChunks(localIds);
           return { modelId, model, chunks };
         })(),
       );
     }
 
     // Wait for every query even on failure before starting the next refresh.
-    const settled = await Promise.allSettled(queries);
+    const [settled, [positions]] = await Promise.all([
+      Promise.allSettled(queries),
+      Promise.allSettled([points]),
+    ]);
     if (!this.isGroupUpdateCurrent(name, state, revision, world, pass)) return;
     const results = settled.map((result) => {
       if (result.status === "rejected") throw result.reason;
       return result.value;
     });
+
+    if (positions.status === "rejected") throw positions.reason;
+    if (positions.value) this.updatePoints(positions.value);
 
     // Attach (or refresh) every tile that came back; track attachments
     // for next-time diffs.
@@ -827,10 +825,8 @@ export class Outliner extends OBC.Component implements OBC.Disposable {
       if (resolved.size > 0) nextResolved.set(modelId, resolved);
     }
 
-    // Detach proxies that were attached before but aren't in the new
-    // result. Covers item removal and items that moved to a different
-    // group.
-    for (const [modelId, prev] of previouslyAttached) {
+    // No awaits follow the revision check: diff against the proxies drawn now.
+    for (const [modelId, prev] of state.attached) {
       const next = nextAttached.get(modelId) ?? new Set<THREE.Mesh>();
       for (const tile of prev) {
         if (!next.has(tile)) pass.detachOutlinedTile(tile, name);

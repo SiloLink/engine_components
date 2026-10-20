@@ -47,12 +47,16 @@ export class ProjectionManager {
    */
   async set(projection: CameraProjection) {
     if (this.current === projection) return;
+    let changed: boolean;
     if (projection === "Orthographic") {
-      this.setOrthoCamera();
+      changed = this.setOrthoCamera();
     } else {
       await this.setPerspectiveCamera();
+      changed = true;
     }
-    this.onChanged.trigger(this.camera);
+    if (changed) {
+      this.onChanged.trigger(this.camera);
+    }
   }
 
   /**
@@ -66,22 +70,35 @@ export class ProjectionManager {
   }
 
   private setOrthoCamera() {
-    if (this._component.mode === null) return;
+    // The navigation mode only exists once the camera has been assigned
+    // to a world. Before that, switching projections is a no-op. Checking
+    // `mode` directly here would throw: its getter errors out when the
+    // camera is uninitialized, which is exactly the case this guard is for.
+    if (!this._component.hasMode) return false;
     // Matching orthographic camera to perspective camera
     // Resource: https://stackoverflow.com/questions/48758959/what-is-required-to-convert-threejs-perspective-camera-to-orthographic
     if (this._component.mode.id === "FirstPerson") {
-      return;
+      return false;
+    }
+    // Check the same conditions that make getPerspectiveDims fail before
+    // writing any state, so an aborted switch doesn't move the camera or
+    // report a projection change that never happened.
+    const world = this._component.currentWorld;
+    if (!world || !world.renderer) {
+      return false;
     }
     this._previousDistance = this._component.controls.distance;
     this._component.controls.distance = 200;
     const dims = this.getPerspectiveDims();
     if (!dims) {
-      return;
+      this._component.controls.distance = this._previousDistance;
+      return false;
     }
     const { width, height } = dims;
     this.setupOrthoCamera(height, width);
     this.camera = this._component.threeOrtho;
     this.current = "Orthographic";
+    return true;
   }
 
   private getPerspectiveDims() {
@@ -100,7 +117,7 @@ export class ProjectionManager {
     const dims = world.renderer.getSize();
     const aspect = dims.x / dims.y;
     const camera = this._component.threePersp;
-    const height = depth * 2 * Math.atan((camera.fov * (Math.PI / 180)) / 2);
+    const height = depth * 2 * Math.tan((camera.fov * (Math.PI / 180)) / 2);
     const width = height * aspect;
     return { width, height };
   }
@@ -129,12 +146,12 @@ export class ProjectionManager {
     const oCamera = this._component.threeOrtho;
 
     // this is the reverse of
-    // const height = depth * 2 * Math.atan((pCamera.fov * (Math.PI / 180)) / 2);
+    // const height = depth * 2 * Math.tan((pCamera.fov * (Math.PI / 180)) / 2);
     // accounting for zoom
     const depth =
       (oCamera.top - oCamera.bottom) /
       oCamera.zoom /
-      (2 * Math.atan((pCamera.fov * (Math.PI / 180)) / 2));
+      (2 * Math.tan((pCamera.fov * (Math.PI / 180)) / 2));
 
     return depth;
   }

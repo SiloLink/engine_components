@@ -30,10 +30,29 @@ export class EdgeProjector extends Component implements Disposable {
   readonly generator: any = new EdgeProjectorProjectionGenerator();
 
   /**
-   * Resolution of the visibility culler in pixels per meter.
-   * Higher values = more accurate occlusion but slower culling.
+   * Size of one visibility-culling pixel, in meters (despite the name, the
+   * value is meters per pixel). LOWER values mean finer culling — fewer small
+   * meshes are discarded — at the cost of a larger render target, more tiles
+   * and more readback time. Higher values are coarser and faster. Default is
+   * 0.05 (one culling pixel covers 5 cm).
+   *
+   * Note: meshes without a single visible pixel are removed from BOTH the
+   * visible and the hidden line sets, so this value bounds how much small
+   * geometry a projection loses.
    */
   cullerPixelsPerMeter = 0.05;
+
+  /**
+   * Alias of {@link EdgeProjector.cullerPixelsPerMeter} under a name that
+   * matches what the value actually is. Reads and writes the same setting.
+   */
+  get cullerMetersPerPixel(): number {
+    return this.cullerPixelsPerMeter;
+  }
+
+  set cullerMetersPerPixel(value: number) {
+    this.cullerPixelsPerMeter = value;
+  }
 
   /**
    * The direction the projector looks along. Meshes are projected onto the plane
@@ -75,6 +94,9 @@ export class EdgeProjector extends Component implements Disposable {
    * @param world - The world whose renderer will be used for visibility culling.
    * @param config - Optional configuration.
    * @param config.onProgress - Optional progress callback receiving (message, progress?, collector?).
+   * @param config.signal - Optional AbortSignal. The generator pumps itself on
+   * requestAnimationFrame and checks it on every frame, so aborting rejects the
+   * returned promise and stops the pump instead of draining the whole task.
    * @returns Visible/hidden geometries with a `group` vertex attribute, and a groups mapping.
    */
   async get(
@@ -82,6 +104,7 @@ export class EdgeProjector extends Component implements Disposable {
     world: World,
     config?: {
       onProgress?: (message: string, progress?: number) => void;
+      signal?: AbortSignal;
     },
   ): Promise<EdgeProjectionResult> {
     const fragments = this.components.get(FragmentsManager);
@@ -200,15 +223,25 @@ export class EdgeProjector extends Component implements Disposable {
     });
 
     // Use groupFn to tag edges by source item
-    const collector = await this.generator.generateAsync(group, {
-      visibilityCuller,
-      groupFn: (mesh: THREE.Mesh) => {
-        const mid = mesh.userData._edgeProjectorModelId ?? "unknown";
-        const lid = mesh.userData._edgeProjectorLocalId ?? 0;
-        return `${mid}:${lid}`;
-      },
-      onProgress: config?.onProgress,
-    });
+    let collector;
+    try {
+      collector = await this.generator.generateAsync(group, {
+        visibilityCuller,
+        groupFn: (mesh: THREE.Mesh) => {
+          const mid = mesh.userData._edgeProjectorModelId ?? "unknown";
+          const lid = mesh.userData._edgeProjectorLocalId ?? 0;
+          return `${mid}:${lid}`;
+        },
+        onProgress: config?.onProgress,
+        signal: config?.signal,
+      });
+    } catch (error) {
+      // Aborted or failed: the source geometries (and their BVHs) are ours.
+      for (const geometry of geometries.values()) {
+        geometry.dispose();
+      }
+      throw error;
+    }
 
     const visible = collector.getVisibleLineGeometry();
     const hidden = collector.getHiddenLineGeometry();
