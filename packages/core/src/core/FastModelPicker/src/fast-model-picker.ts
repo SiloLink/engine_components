@@ -133,6 +133,61 @@ function isRenderable(object: THREE.Object3D) {
   );
 }
 
+/**
+ * How Fragments packs a compacted SHELL tile index, published in
+ * `geometry.userData`: packed run `i` holds the full-index slots
+ * `[start[i], start[i] + count[i])` at the packed slots from `offset[i]`.
+ * Runs follow the full index in order and do not overlap.
+ */
+interface CompactIndexRuns {
+  start: ArrayLike<number>;
+  count: ArrayLike<number>;
+  offset: ArrayLike<number>;
+}
+
+/**
+ * Where the full-index range `[start, start + count)` of a tile is drawn in
+ * the tile's current index. A compacted index holds only the visible runs,
+ * so the hidden parts of the range map to nothing; parts that meet in the
+ * packing form one range.
+ */
+function toDrawnIndexRanges(
+  geometry: THREE.BufferGeometry,
+  start: number,
+  count: number,
+): { start: number; count: number }[] {
+  const { compactIndex, compactRuns } = geometry.userData as {
+    compactIndex?: boolean;
+    compactRuns?: CompactIndexRuns;
+  };
+  if (!compactIndex || !compactRuns) return [{ start, count }];
+  const {
+    start: runStarts,
+    count: runCounts,
+    offset: runOffsets,
+  } = compactRuns;
+  const end = start + count;
+  // The first run that ends after the range starts.
+  let first = 0;
+  let last = runStarts.length;
+  while (first < last) {
+    const middle = (first + last) >>> 1;
+    if (runStarts[middle] + runCounts[middle] <= start) first = middle + 1;
+    else last = middle;
+  }
+  const drawn: { start: number; count: number }[] = [];
+  for (let i = first; i < runStarts.length && runStarts[i] < end; i++) {
+    const from = Math.max(start, runStarts[i]);
+    const to = Math.min(end, runStarts[i] + runCounts[i]);
+    const at = runOffsets[i] + from - runStarts[i];
+    const previous = drawn[drawn.length - 1];
+    if (previous && previous.start + previous.count === at)
+      previous.count += to - from;
+    else drawn.push({ start: at, count: to - from });
+  }
+  return drawn;
+}
+
 // ---------------------------------------------------------------------------
 // Decoders
 // ---------------------------------------------------------------------------
@@ -233,9 +288,11 @@ async function itemIdToLocalId(
 }
 
 /**
- * Optional exact model/tile ranges allowed to contribute to a pick. Ranges use
- * index-buffer coordinates and are intersected with the tile's drawable groups.
- * Undefined permits all drawable geometry; an empty map permits none.
+ * Optional exact model/tile ranges allowed to contribute to a pick. Ranges
+ * address the tile's full index, as Fragments item draw chunks do; a
+ * compacted tile maps them to its packed slots, and they are intersected with
+ * the tile's drawable groups. Undefined permits all drawable geometry; an
+ * empty map permits none.
  */
 export type FastModelPickerCandidateMap = ReadonlyMap<
   string,
@@ -987,7 +1044,10 @@ export class FastModelPicker implements Disposable {
     this._modelRoots.clear();
   }
 
-  /** Intersects candidates with visible material groups and the active draw range. */
+  /**
+   * Intersects candidates, at the slots the tile's index draws them, with
+   * visible material groups and the active draw range.
+   */
   private applyCandidateGroups(
     mesh: THREE.Mesh,
     ranges: readonly { start: number; count: number }[],
@@ -1012,19 +1072,21 @@ export class FastModelPicker implements Disposable {
         !(count === Infinity || (Number.isInteger(count) && count > 0))
       )
         continue;
-      for (const group of sourceGroups) {
-        const start = Math.max(range.start, group.start, drawStart);
-        const end = Math.min(
-          range.start + count,
-          group.start + group.count,
-          drawEnd,
-        );
-        if (end > start)
-          groups.push({
-            start,
-            count: end - start,
-            materialIndex: group.materialIndex,
-          });
+      for (const drawn of toDrawnIndexRanges(geometry, range.start, count)) {
+        for (const group of sourceGroups) {
+          const start = Math.max(drawn.start, group.start, drawStart);
+          const end = Math.min(
+            drawn.start + drawn.count,
+            group.start + group.count,
+            drawEnd,
+          );
+          if (end > start)
+            groups.push({
+              start,
+              count: end - start,
+              materialIndex: group.materialIndex,
+            });
+        }
       }
     }
     if (!groups.length) return false;

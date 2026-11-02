@@ -1362,6 +1362,45 @@ describe("FastModelPicker candidate ranges", () => {
     },
   );
 
+  it("draws candidate chunks of a compacted tile at their packed slots", () => {
+    const { model, picker, renderer, position } = context;
+    const [shell] = model.object.children as THREE.Mesh[];
+    // As Fragments leaves a tile showing full-index slots [0, 6), [12, 18)
+    // and [24, 30): packed one after another and drawn as one group.
+    shell.geometry.groups = [{ start: 0, count: 18, materialIndex: 0 }];
+    shell.geometry.setDrawRange(0, 18);
+    shell.geometry.userData.compactIndex = true;
+    shell.geometry.userData.compactRuns = {
+      start: new Uint32Array([0, 12, 24]),
+      count: new Uint32Array([6, 6, 6]),
+      offset: new Uint32Array([0, 6, 12]),
+    };
+    const drawn: THREE.BufferGeometry["groups"][] = [];
+    renderer.render.mockImplementation((scene, camera) => {
+      drawn.push(shell.geometry.groups.map((group) => ({ ...group })));
+      drawScene(scene, camera);
+    });
+    const pick = (ranges: { start: number; count: number }[]) =>
+      picker.getPointAtSync(
+        position,
+        new Map([[MODEL_ID, new Map([[shell, ranges]])]]),
+      );
+
+    // An item in the second shown run, a range across a hidden one, and the
+    // whole tile, which is the tile as shown.
+    pick([{ start: 12, count: 6 }]);
+    pick([{ start: 3, count: 12 }]);
+    pick([{ start: 0, count: 0xffffffff }]);
+    expect(drawn).toEqual([
+      [{ start: 6, count: 6, materialIndex: 0 }],
+      [{ start: 3, count: 6, materialIndex: 0 }],
+      [{ start: 0, count: 18, materialIndex: 0 }],
+    ]);
+    // A hidden item leaves nothing to pick in the tile.
+    pick([{ start: 6, count: 6 }]);
+    expect(renderer.render).toHaveBeenCalledTimes(3);
+  });
+
   it.each(methods)(
     "%s cannot revive hidden tiles and an empty candidate map draws nothing",
     async (method) => {
