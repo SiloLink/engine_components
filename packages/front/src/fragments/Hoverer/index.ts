@@ -1,5 +1,10 @@
 import * as THREE from "three";
 import * as OBC from "@thatopen/components";
+import {
+  getTileIndexLayout,
+  IndexRange,
+  toDrawnIndexRanges,
+} from "../../utils/tile-index-layout";
 
 /**
  * Per-tile vertex/index range entry returned by
@@ -11,6 +16,11 @@ interface ItemDrawChunks {
   tileId: number;
   position: Uint32Array;
   size: Uint32Array;
+}
+
+interface ProxyChunks {
+  ranges: IndexRange[];
+  layout: ReturnType<typeof getTileIndexLayout>;
 }
 
 /**
@@ -99,7 +109,8 @@ export class Hoverer extends OBC.Component implements OBC.Disposable {
   private _world: OBC.World | null = null;
   set world(value: OBC.World | null) {
     if (value === this._world) return;
-    this.detachAll();
+    this.setupEvents(false);
+    this.clear();
     this._world = value;
     this.setupEvents(this._enabled && !!value);
   }
@@ -161,6 +172,16 @@ export class Hoverer extends OBC.Component implements OBC.Disposable {
    * carries `geometry.groups` covering only the hovered item's slices.
    */
   private _proxies = new Set<THREE.Mesh>();
+  private _removeRenderListener: (() => void) | null = null;
+
+  /** Follow repacking even after a fade ends or while the cursor is still. */
+  private _syncProxies = () => {
+    for (const proxy of this._proxies) {
+      const source = proxy.userData.__hoverSource as THREE.Mesh;
+      proxy.matrixWorld.copy(source.matrixWorld);
+      this.syncProxyGroups(proxy);
+    }
+  };
 
   /**
    * Last-hovered item, or `null` when the cursor is over empty space.
@@ -469,12 +490,14 @@ export class Hoverer extends OBC.Component implements OBC.Disposable {
     proxyGeom.boundingBox = sourceGeom.boundingBox;
     proxyGeom.boundingSphere = sourceGeom.boundingSphere;
 
+    const ranges: IndexRange[] = [];
     const n = Math.min(positions.length, sizes.length);
     for (let i = 0; i < n; i++) {
-      const start = positions[i];
       const raw = sizes[i];
-      const count = raw === 0xffffffff ? Infinity : raw;
-      proxyGeom.addGroup(start, count, 0);
+      ranges.push({
+        start: positions[i],
+        count: raw === 0xffffffff ? Infinity : raw,
+      });
     }
 
     const proxy = new THREE.Mesh(proxyGeom, [this._material]);
@@ -482,11 +505,28 @@ export class Hoverer extends OBC.Component implements OBC.Disposable {
     proxy.matrixWorldAutoUpdate = false;
     proxy.frustumCulled = false; // matrix is owned by source
     proxy.matrixWorld.copy(tile.matrixWorld);
-    // Track the source so we can sync matrices each frame if needed
-    // (the source's matrixWorld is updated by three when the model is
-    // transformed; we mirror it on the next animation tick).
+    // Mirror the source transform and index packing before each render,
+    // including frames after the hover's fade animation has finished.
     proxy.userData.__hoverSource = tile;
+    const chunks: ProxyChunks = { ranges, layout: undefined };
+    proxy.userData.__hoverChunks = chunks;
+    this.syncProxyGroups(proxy, true);
     return proxy;
+  }
+
+  /** Draw the hovered full-index chunks where the source index holds them. */
+  private syncProxyGroups(proxy: THREE.Mesh, force = false) {
+    const source = proxy.userData.__hoverSource as THREE.Mesh;
+    const chunks = proxy.userData.__hoverChunks as ProxyChunks;
+    const layout = getTileIndexLayout(source.geometry);
+    if (!force && layout === chunks.layout) return;
+    chunks.layout = layout;
+    proxy.geometry.clearGroups();
+    for (const { start, count } of toDrawnIndexRanges(
+      source.geometry,
+      chunks.ranges,
+    ))
+      proxy.geometry.addGroup(start, count, 0);
   }
 
   /**
@@ -512,6 +552,8 @@ export class Hoverer extends OBC.Component implements OBC.Disposable {
   }
 
   private setupEvents(active: boolean) {
+    this._removeRenderListener?.();
+    this._removeRenderListener = null;
     if (!this._world || this._world.isDisposing) return;
     if (!this._world.renderer) return;
 
@@ -542,6 +584,9 @@ export class Hoverer extends OBC.Component implements OBC.Disposable {
     this._wheeling = false;
 
     if (!active) return;
+    const beforeRender = this._world.renderer.onBeforeUpdate;
+    beforeRender.add(this._syncProxies);
+    this._removeRenderListener = () => beforeRender.remove(this._syncProxies);
     container.addEventListener("mousemove", this.onMouseMove);
     container.addEventListener("mouseleave", this.onMouseLeave);
 
@@ -627,14 +672,6 @@ export class Hoverer extends OBC.Component implements OBC.Disposable {
     const value = fadeIn ? progress : 1 - progress;
     const maxOpacity = this.material.userData[this.HOVERER_OPACITY_KEY] ?? 1;
     this.material.opacity = value * maxOpacity;
-
-    // Sync proxy matrices from their sources so the overlay tracks
-    // model transforms. Cheap: bounded by proxies attached to one
-    // hovered item (typically 1–3).
-    for (const proxy of this._proxies) {
-      const source = proxy.userData.__hoverSource as THREE.Mesh | undefined;
-      if (source) proxy.matrixWorld.copy(source.matrixWorld);
-    }
 
     if (progress < 1) {
       requestAnimationFrame(this.animate);

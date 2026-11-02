@@ -7,6 +7,8 @@
 * Coalesce Outliner tile refreshes per group, query only changed models, and wait for in-flight queries before refreshing the latest state.
 * Size postproduction passes in the composer's device pixels: `setSize` takes CSS pixels like the resize event, so the outline, excluded-objects and gloss passes keep one resolution whether they were last resized or rebuilt.
 * Draw only model tiles, LOD included, into the edge detection buffer, so grids, measurements and gizmos are no longer outlined as geometry; tiles keep the layers they had.
+* Draw outlines, selection fills, hover and volume overlays at the slots a compacted Fragments tile index packs their chunks in. Item draw chunks address the full index, so while Fragments drew a tile from its packed index, a selection painted other items of that tile, or nothing, depending on the view. Hover overlays follow repacking before a frame even when the pointer stays on the same item or fading is disabled.
+* Fill each outlined slot once, with the highest-priority group covering it. Fills were deduplicated only when their ranges had the same bounds, so an item that was also in a lower group's larger range, such as a batch whose chunk joined a neighbour, was filled twice.
 
 ## [3.4.0](https://github.com/ThatOpen/engine_components/compare/v3.3.2...v3.4.0) (2026-04-09)
 

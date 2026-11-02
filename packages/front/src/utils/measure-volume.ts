@@ -2,6 +2,20 @@ import * as THREE from "three";
 import * as OBC from "@thatopen/components";
 import { Volume } from "./volume";
 import { MeasureMark } from "./measure-mark";
+import {
+  getTileIndexLayout,
+  IndexRange,
+  toDrawnIndexRanges,
+} from "./tile-index-layout";
+
+/**
+ * The chunks a proxy draws, in its tile's full index, and the tile index
+ * packing its groups follow.
+ */
+interface ProxyChunks {
+  ranges: IndexRange[];
+  layout: ReturnType<typeof getTileIndexLayout>;
+}
 
 /**
  * Visual representation of a {@link Volume} measurement.
@@ -9,7 +23,8 @@ import { MeasureMark } from "./measure-mark";
  * Items added to the volume are highlighted by **proxy meshes** that
  * alias each source tile's `BufferGeometry` attributes and `index`,
  * with `geometry.groups` set to the per-item draw ranges returned by
- * `FragmentsModel.getItemDrawChunks`. No vertex / normal / index data
+ * `FragmentsModel.getItemDrawChunks`, at the slots the tile's current
+ * index draws them. No vertex / normal / index data
  * is duplicated — a proxy carries no GPU memory of its own beyond a
  * small `BufferGeometry` wrapper. On a 250k-item model this means the
  * cost of visualising a measurement is proportional to the number of
@@ -110,6 +125,12 @@ export class MeasureVolume {
     this.update().catch(() => undefined);
   };
 
+  // Fragments repacks a compacted tile index as the view changes, so the
+  // proxies follow it before every frame.
+  private _syncProxies = () => {
+    for (const mesh of this.meshes) this.syncProxyGroups(mesh);
+  };
+
   /** Includes constructor and item-change work, including a retired visual. */
   async whenSettled(): Promise<void> {
     while (this._pending.size) await Promise.allSettled([...this._pending]);
@@ -130,6 +151,7 @@ export class MeasureVolume {
     this.visible = true;
     this._onItemsChanged();
     this.volume.onItemsChanged.add(this._onItemsChanged);
+    this.world.renderer?.onBeforeUpdate.add(this._syncProxies);
   }
 
   applyPlanesVisibility(planes: THREE.Plane[]) {
@@ -190,12 +212,14 @@ export class MeasureVolume {
     proxyGeom.boundingBox = sourceGeom.boundingBox;
     proxyGeom.boundingSphere = sourceGeom.boundingSphere;
 
+    const ranges: IndexRange[] = [];
     const n = Math.min(positions.length, sizes.length);
     for (let i = 0; i < n; i++) {
-      const start = positions[i];
       const raw = sizes[i];
-      const count = raw === 0xffffffff ? Infinity : raw;
-      proxyGeom.addGroup(start, count, 0);
+      ranges.push({
+        start: positions[i],
+        count: raw === 0xffffffff ? Infinity : raw,
+      });
     }
 
     const proxy = new THREE.Mesh(proxyGeom, this.materialArray);
@@ -208,7 +232,29 @@ export class MeasureVolume {
     proxy.frustumCulled = false;
     proxy.matrixWorld.copy(tile.matrixWorld);
     proxy.userData.__measureVolumeSource = tile;
+    const chunks: ProxyChunks = { ranges, layout: undefined };
+    proxy.userData.__measureVolumeChunks = chunks;
+    this.syncProxyGroups(proxy, true);
     return proxy;
+  }
+
+  /**
+   * Points a proxy's groups at the slots its tile's index holds its chunks
+   * in. Without `force` this does nothing unless Fragments repacked the
+   * index since the last call.
+   */
+  private syncProxyGroups(proxy: THREE.Mesh, force = false) {
+    const tile = proxy.userData.__measureVolumeSource as THREE.Mesh;
+    const chunks = proxy.userData.__measureVolumeChunks as ProxyChunks;
+    const layout = getTileIndexLayout(tile.geometry);
+    if (!force && layout === chunks.layout) return;
+    chunks.layout = layout;
+    proxy.geometry.clearGroups();
+    for (const { start, count } of toDrawnIndexRanges(
+      tile.geometry,
+      chunks.ranges,
+    ))
+      proxy.geometry.addGroup(start, count, 0);
   }
 
   update(): Promise<void> {
@@ -261,6 +307,7 @@ export class MeasureVolume {
     this._disposed = true;
     this._revision += 1;
     this.volume.onItemsChanged.remove(this._onItemsChanged);
+    this.world.renderer?.onBeforeUpdate.remove(this._syncProxies);
     this.label.dispose();
     this.cleanMeshes();
     this._material.dispose();

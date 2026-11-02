@@ -4,6 +4,10 @@ import {
   Pass,
   FullScreenQuad,
 } from "three/examples/jsm/postprocessing/Pass.js";
+import {
+  getTileIndexLayout,
+  toDrawnIndexRanges,
+} from "../../../utils/tile-index-layout";
 
 const PALETTE_SIZE = 256;
 const DEFAULT_GROUP = "default";
@@ -18,6 +22,31 @@ const MESH_FILL_GROUP_ORDER = -1_000_000;
 interface DrawRange {
   start: number;
   count: number;
+}
+
+/**
+ * The parts of `ranges` outside `covered`. Neither overlaps itself, and
+ * `covered` is in index order.
+ */
+function subtractRanges(
+  ranges: readonly DrawRange[],
+  covered: readonly DrawRange[],
+): DrawRange[] {
+  const rest: DrawRange[] = [];
+  for (const range of ranges) {
+    let start = range.start;
+    const end = range.start + range.count;
+    for (const cover of covered) {
+      if (cover.start >= end) break;
+      const coverEnd = cover.start + cover.count;
+      if (coverEnd <= start) continue;
+      if (cover.start > start) rest.push({ start, count: cover.start - start });
+      start = coverEnd;
+      if (start >= end) break;
+    }
+    if (start < end) rest.push({ start, count: end - start });
+  }
+  return rest;
 }
 
 interface OutlineGroup {
@@ -55,12 +84,17 @@ type OutlineGroupConfig = Partial<
  *
  * Per-frame the proxy's `matrixWorld` is synced from the source so the
  * outline tracks the tile through camera moves and any model-level
- * transforms.
+ * transforms, and its groups follow the tile's index packing.
  */
 interface OutlinedTileProxy {
   source: THREE.Mesh;
   proxy: THREE.Mesh;
+  /** The outlined chunks, in the tile's full index. */
   ranges: DrawRange[];
+  /** The chunks at the slots the tile's current index draws them. */
+  drawn: readonly DrawRange[];
+  /** The tile index packing `drawn` follows, undefined for the full index. */
+  layout: ReturnType<typeof getTileIndexLayout>;
   groupName: string;
 }
 
@@ -71,7 +105,7 @@ interface TileFill {
   tile: THREE.Mesh;
   targets: Set<OutlinedTileProxy>;
   /** Fills for the current scene render, highest group priority first. */
-  fills: { ranges: DrawRange[]; material: THREE.MeshBasicMaterial }[];
+  fills: { ranges: readonly DrawRange[]; material: THREE.MeshBasicMaterial }[];
   /** Installed on the tile only while a scene render fills it. */
   hook: RenderHook;
   installed: boolean;
@@ -137,8 +171,6 @@ export class SimpleOutlinePass extends Pass {
   private _fsQuad: FullScreenQuad;
   private _debugQuad: FullScreenQuad;
   private _tileFills = new Map<THREE.Mesh, TileFill>();
-  private readonly _filledStarts: number[] = [];
-  private readonly _filledEnds: number[] = [];
   private readonly _fillRange: THREE.GeometryGroup = {
     start: 0,
     count: 0,
@@ -486,7 +518,9 @@ export class SimpleOutlinePass extends Pass {
    * Attach a tile mesh as an outline target. Creates a proxy mesh that
    * shares the source's `geometry.attributes` and `index` and draws only
    * the slices specified by `position[i] / size[i]` (parallel arrays of
-   * index-buffer offsets).
+   * offsets into the tile's full index, as Fragments item draw chunks give
+   * them; while Fragments draws a compacted index, they are drawn at their
+   * packed slots).
    *
    * Calling again with the same tile rebuilds the proxy's groups from
    * the new chunks; calling with a different `groupName` reparents the
@@ -504,17 +538,12 @@ export class SimpleOutlinePass extends Pass {
     const existing = this._outlinedTiles.get(key);
     if (existing) {
       existing.ranges = this.copyRanges(chunks);
-      this.refreshAliasedGeometry(existing.proxy.geometry, tile.geometry);
-      this.fillProxyGroups(existing.proxy.geometry, existing.ranges);
+      this.syncProxyLayout(existing, true);
       existing.proxy.visible = this.groupNeedsMask(group);
       return;
     }
 
-    const sourceGeom = tile.geometry;
     const proxyGeom = new THREE.BufferGeometry();
-    this.refreshAliasedGeometry(proxyGeom, sourceGeom);
-    const ranges = this.copyRanges(chunks);
-    this.fillProxyGroups(proxyGeom, ranges);
 
     // Material assigned as `Material[]`, not a single `Material`. Three's
     // `WebGLRenderer.renderObject` only honors `geometry.groups` when the
@@ -532,9 +561,12 @@ export class SimpleOutlinePass extends Pass {
     const target: OutlinedTileProxy = {
       source: tile,
       proxy,
-      ranges,
+      ranges: this.copyRanges(chunks),
+      drawn: [],
+      layout: undefined,
       groupName,
     };
+    this.syncProxyLayout(target, true);
     this._outlinedTiles.set(key, target);
     this.addTileFill(target);
   }
@@ -675,11 +707,13 @@ export class SimpleOutlinePass extends Pass {
     renderer.setRenderTarget(this._maskTarget);
     renderer.clear(true, true, false);
 
-    // Sync proxy matrices from their source tiles. Cheap: bounded by the
-    // number of currently-outlined tiles, not items. The source's
-    // `matrixWorld` is updated by three when the model gets transformed.
+    // Sync proxy matrices and index packing from their source tiles. Cheap:
+    // bounded by the number of currently-outlined tiles, not items. The
+    // source's `matrixWorld` is updated by three when the model gets
+    // transformed.
     if (this._outlinedTiles.size > 0) {
       for (const target of this._outlinedTiles.values()) {
+        this.syncProxyLayout(target);
         this.syncProxyTransform(target.proxy, target.source);
         const group = this._groups.get(target.groupName);
         target.proxy.visible =
@@ -723,7 +757,8 @@ export class SimpleOutlinePass extends Pass {
    */
   showSceneFills(scene: THREE.Object3D) {
     // An item in several groups, such as a selection and its batch, gets the
-    // fill of the highest-priority group once.
+    // fill of the highest-priority group once: a group fills only the slots
+    // that higher ones leave, whatever the bounds of their ranges.
     for (const entry of this._tileFills.values()) {
       entry.fills.length = 0;
       const targets = [...entry.targets]
@@ -733,11 +768,14 @@ export class SimpleOutlinePass extends Pass {
         }))
         .filter(({ group }) => group && group.fillOpacity > 0)
         .sort((a, b) => b.group!.priority - a.group!.priority);
+      const filled: DrawRange[] = [];
       for (const { target, group } of targets) {
-        entry.fills.push({
-          ranges: target.ranges,
-          material: group!.fillMaterial,
-        });
+        this.syncProxyLayout(target);
+        const ranges = subtractRanges(target.drawn, filled);
+        if (ranges.length === 0) continue;
+        entry.fills.push({ ranges, material: group!.fillMaterial });
+        filled.push(...ranges);
+        filled.sort((a, b) => a.start - b.start);
       }
       if (entry.fills.length > 0) this.installTileHook(entry);
     }
@@ -866,18 +904,13 @@ export class SimpleOutlinePass extends Pass {
     const drawn = group as THREE.GeometryGroup | null;
     const start = drawn ? drawn.start : geometry.drawRange.start;
     const end = start + (drawn ? drawn.count : geometry.drawRange.count);
-    // Runs for every drawn range of an outlined tile: no allocations.
-    const starts = this._filledStarts;
-    const ends = this._filledEnds;
-    starts.length = 0;
-    ends.length = 0;
+    // Runs for every drawn range of an outlined tile: no allocations. Fill
+    // ranges do not overlap, so each outlined slot is filled once.
     for (const fill of entry.fills) {
       for (const range of fill.ranges) {
         const from = Math.max(start, range.start);
         const to = Math.min(end, range.start + range.count);
-        if (to <= from || this.wasFilled(from, to)) continue;
-        starts.push(from);
-        ends.push(to);
+        if (to <= from) continue;
         this._fillRange.start = from;
         this._fillRange.count = to - from;
         renderer.renderBufferDirect(
@@ -890,15 +923,6 @@ export class SimpleOutlinePass extends Pass {
         );
       }
     }
-  }
-
-  private wasFilled(from: number, to: number) {
-    for (let i = 0; i < this._filledStarts.length; i++) {
-      if (this._filledStarts[i] === from && this._filledEnds[i] === to) {
-        return true;
-      }
-    }
-    return false;
   }
 
   private createSceneFill(
@@ -976,9 +1000,24 @@ export class SimpleOutlinePass extends Pass {
   private refreshOutlinedTileProxy(target: OutlinedTileProxy) {
     const group = this._groups.get(target.groupName);
     if (!group) return;
-    this.refreshAliasedGeometry(target.proxy.geometry, target.source.geometry);
-    this.fillProxyGroups(target.proxy.geometry, target.ranges);
+    this.syncProxyLayout(target, true);
     target.proxy.visible = this.groupNeedsMask(group);
+  }
+
+  /**
+   * Aliases the tile's buffers and draws the outlined chunks where the
+   * tile's index holds them. Fragments repacks a compacted index as the view
+   * changes, so a change of packing redraws the groups; `force` redraws them
+   * anyway, for new chunks or new tile buffers.
+   */
+  private syncProxyLayout(target: OutlinedTileProxy, force = false) {
+    const geometry = target.source.geometry;
+    const layout = getTileIndexLayout(geometry);
+    if (!force && layout === target.layout) return;
+    target.layout = layout;
+    target.drawn = toDrawnIndexRanges(geometry, target.ranges);
+    this.refreshAliasedGeometry(target.proxy.geometry, geometry);
+    this.fillProxyGroups(target.proxy.geometry, target.drawn);
   }
 
   private destroyOutlinedTileProxy(target: OutlinedTileProxy) {
